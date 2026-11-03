@@ -1,0 +1,12 @@
+# Python caches
+__pycache__/
+*.pyc
+
+# PyInstaller build outputs
+build/
+dist/
+*.spec
+
+# Local application data
+state.json
+*.bak
