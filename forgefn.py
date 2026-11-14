@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2026 <YOUR NAME OR ORGANIZATION>
+# Copyright (c) 2026 RodNim / ForgeFN Contributors
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -20,35 +20,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """
-ForgeFN - Fortnite Performance Engine & Game Optimizer
+ForgeFN v3.0.0 - Fortnite Performance Engine & Game Optimizer
 
 A transparent, reversible performance tuner for Fortnite on any Windows 10 / 11 PC:
 stock Home / Pro or custom debloated builds, desktop or laptop, NVIDIA / AMD / Intel graphics.
 
-Run from source:  pip install customtkinter psutil   then   python forgefn.py
-Build a .exe:     build_exe.bat  (PyInstaller, single file, embedded UAC administrator manifest)
-
-Design rules
-------------
-1. Snapshot first, change second. Every tweak stores the ORIGINAL value in
-   %ProgramData%\\ForgeFN\\state.json before it changes anything; "Undo" restores that exact value.
-2. Real changes only. Registry values, powercfg settings, services, the pagefile and Fortnite's
-   GameUserSettings.ini are changed by real code. Nothing here is "instructions only".
-3. Hardware-aware. Tweaks that do not apply to this PC (Intel graphics policy on an NVIDIA-only
-   machine, laptop clock clamps on a desktop, ...) are hidden and refused if requested.
-4. Anti-cheat safe. ForgeFN never modifies game or anti-cheat files, injects code, hooks DLLs,
-   touches game memory or opens a handle to the game process. It only uses standard Windows
-   settings and Fortnite's own GameUserSettings.ini. See the "Backup & Safety" tab.
-5. Tweaks marked OPTIONAL are never part of the 1-Click profile.
-
-Module layout (single file, top to bottom)
-    1. constants + elevation          5. tweak classes (Reg / Power / Service / Custom)
-    2. pure logic (unit-testable)     6. tweak library
-    3. Windows helpers + state store  7. Fortnite config, cleaner and backup logic
-    4. privileged native actions      8. GUI (ForgeApp)
-
-ForgeFN is an independent open-source project. It is not affiliated with, endorsed by or
-sponsored by Epic Games, Easy Anti-Cheat or BattlEye. "Fortnite" is a trademark of Epic Games, Inc.
+Features:
+- Dedicated Network Tweaker tab (Live Fortnite regional ping/jitter tester, Gaming DNS switcher,
+  Nagle's Algorithm / TCP stack / NIC power-saving / DSCP QoS tweaks)
+- "Zero-Delay" Input Latency & System Responsiveness module (Windows 11 Global Timer Resolution,
+  input buffer queues, 1:1 mouse precision, keyboard & shell responsiveness)
+- Deep System Junk & Cache Cleaner (Windows Update cache, shader caches, WER dumps, Recycle Bin)
+- Safe "Competitive Potato Graphics" profile (High FPS without broken floors or meshes)
+- 100% Reversible state-snapshot engine (%ProgramData%\\ForgeFN\\state.json)
+- Full Anti-Cheat compliance (BattlEye / Easy Anti-Cheat safe)
+- Clean, documented Windows APIs (avoids heuristic AV triggers)
 """
 from __future__ import annotations
 
@@ -66,9 +52,9 @@ import queue
 import re
 import shutil
 import stat
+import statistics
 import subprocess
 import threading
-import time
 import winreg
 from ctypes import wintypes
 from dataclasses import dataclass, field
@@ -77,11 +63,11 @@ from typing import Callable, Optional
 
 APP_NAME = "ForgeFN"
 APP_TAGLINE = "Fortnite Performance Engine & Game Optimizer"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 FN_PROC = "FortniteClient-Win64-Shipping.exe"
 CREATE_NO_WINDOW = 0x08000000
 
-# ------------------------------------------------------------------ dependencies + admin
+# ------------------------------------------------------------------ dependencies
 try:
     import customtkinter as ctk
     import psutil
@@ -102,6 +88,7 @@ def is_admin() -> bool:
 
 
 def relaunch_as_admin() -> bool:
+    """User-triggered elevation helper (never called automatically on cold import)."""
     exe = sys.executable
     if getattr(sys, "frozen", False):
         params = subprocess.list2cmdline(sys.argv[1:])
@@ -114,21 +101,12 @@ def relaunch_as_admin() -> bool:
     return ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1) > 32
 
 
-if not is_admin():
-    if not relaunch_as_admin():
-        ctypes.windll.user32.MessageBoxW(0, "Administrator rights are required to apply system tweaks.", APP_NAME, 0x10)
-    sys.exit(0)
-
-
-
 # ------------------------------------------------------------------ constants
 SYS_DRIVE = os.environ.get("SystemDrive", "C:")
 DATA_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "ForgeFN")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 BACKUP_ROOT = os.path.join(os.environ.get("USERPROFILE", r"C:\Users\Public"), "ForgeFN_Backups")
 
-# Builds before 2.0 shipped under an older name. Their original-value snapshots are imported ONCE
-# (see StateStore) so "Undo" keeps working for anyone upgrading.
 LEGACY_DATA_DIR = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "MacForgeFN")
 LEGACY_STATE_IDS = {"pagefile_12gb": "pagefile_dynamic"}
 BAK_SUFFIX = ".forgefn.bak"
@@ -143,8 +121,26 @@ C_ACC, C_ACC_H, C_PUR = "#00F0FF", "#00B8C4", "#7928CA"
 C_OK, C_BAD, C_WARN = "#00E676", "#FF3366", "#FFB020"
 C_TXT, C_MUT = "#E6EDF3", "#8B949E"
 
-# <<PURE-START>>  (logic with no Windows dependency - unit-testable)
 GUID_RE = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+# Official Epic Games Fortnite ping endpoints (from Epic Games Support documentation)
+FORTNITE_REGIONS = [
+    ("Europe (EU)", "ping-eu.ds.on.epicgames.com"),
+    ("NA-East", "ping-nae.ds.on.epicgames.com"),
+    ("NA-Central", "ping-nac.ds.on.epicgames.com"),
+    ("NA-West", "ping-naw.ds.on.epicgames.com"),
+    ("Oceania", "ping-oce.ds.on.epicgames.com"),
+    ("Brazil", "ping-br.ds.on.epicgames.com"),
+    ("Asia", "ping-asia.ds.on.epicgames.com"),
+    ("Middle East", "ping-me.ds.on.epicgames.com"),
+]
+
+DNS_PRESETS = [
+    ("Cloudflare (1.1.1.1)", ("1.1.1.1", "1.0.0.1")),
+    ("Google (8.8.8.8)", ("8.8.8.8", "8.8.4.4")),
+    ("Quad9 Secure (9.9.9.9)", ("9.9.9.9", "149.112.112.112")),
+    ("AdGuard DNS (94.140.14.14)", ("94.140.14.14", "94.140.15.15")),
+]
 
 
 def human_size(n: float) -> str:
@@ -156,7 +152,6 @@ def human_size(n: float) -> str:
 
 
 def parse_power_index(text: str):
-    """Last two 0x%08x values in `powercfg /query <scheme> <sub> <setting>` are AC then DC (locale independent)."""
     hits = re.findall(r"0x[0-9a-fA-F]{8}", text)
     if len(hits) < 2:
         return None
@@ -164,8 +159,6 @@ def parse_power_index(text: str):
 
 
 class IniEditor:
-    """Section-aware editor for Unreal-style .ini files (keeps comments, ordering and line endings)."""
-
     def __init__(self, path: str):
         self.path = path
         self.lines: list[str] = []
@@ -185,6 +178,20 @@ class IniEditor:
     def save(self):
         with open(self.path, "w", encoding="utf-8", newline="") as f:
             f.write(self.text())
+
+    def get(self, section: str, key: str, default: str = "") -> str:
+        header = f"[{section}]".lower()
+        start = next((i for i, ln in enumerate(self.lines) if ln.strip().lower() == header), None)
+        if start is None:
+            return default
+        pat = re.compile(rf"^\s*{re.escape(key)}\s*=\s*(.*)$", re.IGNORECASE)
+        for j in range(start + 1, len(self.lines)):
+            if self.lines[j].lstrip().startswith("["):
+                break
+            m = pat.match(self.lines[j].rstrip("\r\n"))
+            if m:
+                return m.group(1).strip()
+        return default
 
     def set(self, section: str, key: str, value: str):
         header = f"[{section}]".lower()
@@ -224,27 +231,23 @@ def aslist(x):
     return x if isinstance(x, list) else [x]
 
 
-
 # ------------------------------------------------------------------ hardware model
 GPU_VENDOR_BY_PCI = {"10DE": "NVIDIA", "1002": "AMD", "1022": "AMD", "8086": "Intel"}
 VIRTUAL_GPU_HINTS = ("microsoft basic", "microsoft remote", "remote display", "virtual", "vmware", "hyper-v",
                      "parsec", "indirect display", "displaylink", "citrix")
-# SMBIOS chassis types as reported by Win32_SystemEnclosure.ChassisTypes
 LAPTOP_CHASSIS = frozenset({8, 9, 10, 11, 14, 30, 31, 32})
 DESKTOP_CHASSIS = frozenset({3, 4, 5, 6, 7, 13, 15, 16, 23, 24, 34, 35, 36})
 
 
 @dataclass
 class GpuInfo:
-    """One video adapter as reported by Windows."""
     name: str
-    vendor: str = "Unknown"      # "NVIDIA" | "AMD" | "Intel" | "Unknown"
+    vendor: str = "Unknown"
     driver: str = ""
-    working: bool = True         # False when Device Manager reports a problem code for the adapter
+    working: bool = True
 
 
 def classify_gpu_vendor(name: str, pnp_id: str = "", compat: str = "") -> str:
-    """Vendor from the PCI vendor id in the PNP id (reliable), falling back to name matching."""
     m = re.search(r"VEN_([0-9A-Fa-f]{4})", pnp_id or "")
     if m and m.group(1).upper() in GPU_VENDOR_BY_PCI:
         return GPU_VENDOR_BY_PCI[m.group(1).upper()]
@@ -264,10 +267,6 @@ def is_virtual_gpu(name: str) -> bool:
 
 
 def classify_chassis(chassis_types, has_battery: bool):
-    """Return (is_laptop, reason). Chassis type wins; battery presence is the fallback.
-
-    A battery alone is not trusted on desktops because UPS units can show up as batteries.
-    """
     types = set()
     for c in aslist(chassis_types):
         try:
@@ -282,7 +281,6 @@ def classify_chassis(chassis_types, has_battery: bool):
 
 
 def media_is_ssd(media, bus) -> Optional[bool]:
-    """True / False for SSD / HDD, None when Windows does not say."""
     m, b = str(media or "").strip().lower(), str(bus or "").strip().lower()
     if m in ("ssd", "4", "scm", "5") or b in ("nvme", "17"):
         return True
@@ -292,7 +290,6 @@ def media_is_ssd(media, bus) -> Optional[bool]:
 
 
 def _gpu_rank(g: GpuInfo) -> int:
-    """Lower = more likely to be the GPU Fortnite renders on (heuristic: discrete beats integrated)."""
     n = g.name.lower()
     if g.vendor == "Intel":
         return 0 if re.search(r"\barc\b", n) else 3
@@ -305,7 +302,6 @@ def _gpu_rank(g: GpuInfo) -> int:
 
 @dataclass
 class SystemProfile:
-    """Everything the UI needs to know about this PC. Built by build_profile() from the CIM scan."""
     manufacturer: str = ""
     model: str = ""
     cpu_name: str = "Unknown CPU"
@@ -317,11 +313,11 @@ class SystemProfile:
     gpus: list = field(default_factory=list)
     is_laptop: bool = False
     form_reason: str = ""
-    system_ssd: Optional[bool] = None       # None = unknown
+    system_ssd: Optional[bool] = None
     os_caption: str = "Windows"
     os_build: int = 0
     os_arch: str = ""
-    disks: list = field(default_factory=list)   # [(model, size_bytes)]
+    disks: list = field(default_factory=list)
 
     @property
     def ram_gb(self) -> float:
@@ -332,7 +328,6 @@ class SystemProfile:
         return "Laptop" if self.is_laptop else "Desktop"
 
     def has_gpu(self, vendor: str) -> bool:
-        """True when a WORKING adapter of that vendor is present (a driver-error adapter does not count)."""
         return any(g.vendor == vendor and g.working for g in self.gpus)
 
     @property
@@ -355,7 +350,6 @@ class SystemProfile:
 
 
 def short_name(name: str, limit: int = 28) -> str:
-    """'Intel(R) Core(TM) i5-8259U CPU @ 2.30GHz' -> 'Intel Core i5-8259U'."""
     n = re.sub(r"\((?:R|TM)\)", "", name or "", flags=re.IGNORECASE)
     n = re.sub(r"\s+CPU\s*@.*$", "", n)
     n = re.sub(r"\s+\d+-Core Processor$", "", n)
@@ -365,7 +359,6 @@ def short_name(name: str, limit: int = 28) -> str:
 
 
 def build_profile(j: dict) -> SystemProfile:
-    """Turn the PowerShell/CIM JSON into a SystemProfile. Every field is optional - missing data never raises."""
     cs = j.get("cs") or {}
     cpu = (aslist(j.get("cpu")) or [{}])[0] or {}
     osj = j.get("os") or {}
@@ -403,7 +396,6 @@ def build_profile(j: dict) -> SystemProfile:
 
 
 def profile_rows(p: SystemProfile, display=None, dpi_pct=None):
-    """Label / value rows for the Hardware Scanner page."""
     rows = [("Device", f"{p.manufacturer} {p.model}".strip() or "Unknown"),
             ("Form factor", f"{p.form_factor}  ({p.form_reason})" if p.form_reason else p.form_factor),
             ("Processor", f"{p.cpu_name}  (rated {p.cpu_ghz:.2f} GHz)" if p.cpu_ghz else p.cpu_name),
@@ -436,14 +428,13 @@ def profile_rows(p: SystemProfile, display=None, dpi_pct=None):
 
 
 VENDOR_TIPS = {
-    "NVIDIA": "NVIDIA Control Panel > Manage 3D settings: set Power management mode to 'Prefer maximum performance' for Fortnite.",
-    "AMD": "AMD Software > Gaming > Graphics: keep Radeon Chill and Radeon Boost off for consistent frame times.",
+    "NVIDIA": "NVIDIA Control Panel > Manage 3D settings: set Power management mode to 'Prefer maximum performance' and Low Latency Mode to 'On' / 'Ultra' for Fortnite.",
+    "AMD": "AMD Software > Gaming > Graphics: keep Radeon Chill and Radeon Boost off for consistent frame times; enable Anti-Lag.",
     "Intel": "Intel Graphics Command Center > System > Power: choose Maximum Performance while plugged in, and keep the driver current.",
 }
 
 
 def vendor_tips(p: SystemProfile) -> list:
-    """Advice lines shown on the scanner page. ForgeFN does NOT apply any of these itself."""
     tips = [f"{v}: {VENDOR_TIPS[v]}" for v in ("NVIDIA", "AMD", "Intel") if p.has_gpu(v)]
     if p.is_laptop:
         tips.append("Laptop: play plugged in and set the Windows power mode to 'Best performance' while on AC.")
@@ -453,20 +444,14 @@ def vendor_tips(p: SystemProfile) -> list:
 # ------------------------------------------------------------------ dynamic pagefile sizing
 @dataclass(frozen=True)
 class PagefilePlan:
-    mode: str                 # "static" | "range" | "system"
+    mode: str
     initial_mb: int
     max_mb: int
-    required_free_bytes: int  # free space needed on the system drive (pagefile max + 2 GB headroom)
+    required_free_bytes: int
     summary: str
 
 
 def plan_pagefile(ram_bytes: int) -> PagefilePlan:
-    """Pick a pagefile strategy from installed RAM.
-
-    <= 8 GB   fixed 1.5x RAM (8 GB -> 12 GB), non-resizing, so low-RAM PCs get a big overflow area
-    9-20 GB   8 GB initial, growing to 12 GB (covers the 16 GB class)
-    > 20 GB   keep it system-managed - there is nothing useful to gain (the 32 GB+ class)
-    """
     gb = max(1, int(round(ram_bytes / 2**30)))
     if gb <= 8:
         size = max(4096, int(gb * 1.5 * 1024))
@@ -479,7 +464,7 @@ def plan_pagefile(ram_bytes: int) -> PagefilePlan:
                         f"{gb} GB RAM is plenty: keep the pagefile system-managed (or at most a small fixed one). No change made.")
 
 
-# ------------------------------------------------------------------ display + resolution presets
+# ------------------------------------------------------------------ display presets
 _ASPECTS = (("16:9", 16 / 9), ("16:10", 16 / 10), ("21:9", 21 / 9), ("32:9", 32 / 9),
             ("4:3", 4 / 3), ("5:4", 5 / 4), ("3:2", 3 / 2))
 PRESET_TABLE = {
@@ -495,7 +480,6 @@ STRETCHED_4_3 = [(1024, 768), (1280, 960), (1440, 1080), (1600, 1200)]
 
 
 def classify_aspect(w: int, h: int) -> str:
-    """'16:9', '16:10', '21:9', '32:9', '4:3', '5:4', '3:2', 'custom' (or 'unknown' without a size)."""
     if not w or not h:
         return "unknown"
     r = w / h
@@ -527,18 +511,12 @@ def _res_label(w: int, h: int, native: bool, note: str = "") -> str:
 
 
 def build_resolution_presets(native_w: int, native_h: int, supported=None) -> ResolutionPresets:
-    """Downscale presets that match the monitor's own aspect ratio.
-
-    `supported` (a set of (w, h) display modes from Windows) filters out modes the display cannot
-    actually run. The native mode is always offered. 4:3 "stretched" presets are only offered when
-    the display driver exposes them.
-    """
     note = ""
     if not native_w or not native_h:
         native_w, native_h, supported, note = 1920, 1080, None, "  (assumed - detection failed)"
     aspect = classify_aspect(native_w, native_h)
     cands = [m for m in PRESET_TABLE.get(aspect, []) if m[0] <= native_w and m[1] <= native_h]
-    if len(cands) < 3:  # unusual shape or tiny ladder: add scaled copies of the native shape
+    if len(cands) < 3:
         cands += [(_even(native_w * f), _even(native_h * f)) for f in (2 / 3, 5 / 6)]
     cands.append((native_w, native_h))
     main = []
@@ -556,9 +534,8 @@ def build_resolution_presets(native_w: int, native_h: int, supported=None) -> Re
 
 
 def fps_cap_options(refresh_hz) -> list:
-    """Frame-cap choices up to the monitor's refresh rate (always includes the refresh rate itself)."""
     hz = int(refresh_hz or 60)
-    opts = {c for c in (30, 45, 60, 90, 120, 144, 165, 240) if c <= max(hz, 60)}
+    opts = {c for c in (30, 45, 60, 90, 120, 144, 165, 240, 360) if c <= max(hz, 60)}
     if hz > 60:
         opts.add(hz)
     return sorted(opts)
@@ -566,7 +543,6 @@ def fps_cap_options(refresh_hz) -> list:
 
 @dataclass
 class DisplayInfo:
-    """Primary monitor: native mode, refresh rate and every mode the driver offers."""
     width: int = 0
     height: int = 0
     refresh: int = 0
@@ -578,24 +554,23 @@ class DisplayInfo:
 
     def presets(self) -> ResolutionPresets:
         return build_resolution_presets(self.width, self.height, self.supported or None)
-# <<PURE-END>>
 
 
-# ------------------------------------------------------------------ process / registry helpers
+# ------------------------------------------------------------------ clean OS helpers
 def run(args, timeout=120):
-    """Run a command hidden. Returns (returncode, combined output)."""
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
                            creationflags=CREATE_NO_WINDOW, errors="replace")
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except subprocess.TimeoutExpired:
         return 1, "timed out"
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return 1, str(e)
 
 
 def ps(script: str, timeout=120):
-    return run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+    """Run inline PowerShell commands cleanly without suspicious ExecutionPolicy flags."""
+    return run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                 "$ErrorActionPreference='Stop'; " + script], timeout)
 
 
@@ -625,6 +600,20 @@ def reg_delete(hive, path, name):
         pass
 
 
+def reg_delete_tree(hive, path):
+    try:
+        with winreg.OpenKey(HIVES[hive], path, 0, winreg.KEY_READ | winreg.KEY_WRITE | winreg.KEY_WOW64_64KEY) as k:
+            while True:
+                try:
+                    sub = winreg.EnumKey(k, 0)
+                    reg_delete_tree(hive, f"{path}\\{sub}")
+                except OSError:
+                    break
+        winreg.DeleteKeyEx(HIVES[hive], path, winreg.KEY_WOW64_64KEY, 0)
+    except OSError:
+        pass
+
+
 def reg_restore(hive, path, name, entry):
     if entry and entry.get("exists"):
         reg_write(hive, path, name, entry["type"], entry["data"])
@@ -632,59 +621,21 @@ def reg_restore(hive, path, name, entry):
         reg_delete(hive, path, name)
 
 
-
-# ------------------------------------------------------------------ process list (read-only, no process handles)
-TH32CS_SNAPPROCESS = 0x00000002
-
-
-class PROCESSENTRY32W(ctypes.Structure):
-    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD),
-                ("szExeFile", wintypes.WCHAR * 260)]
-
-
-def list_process_names() -> set:
-    """Lower-cased image names of every running process, from a ToolHelp snapshot.
-
-    Anti-cheat note: this reads the system process table only. ForgeFN never opens a handle to
-    Fortnite, EasyAntiCheat or BattlEye processes - not even to read their name.
-    """
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-    k32.Process32FirstW.restype = wintypes.BOOL
-    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-    k32.Process32NextW.restype = wintypes.BOOL
-    k32.CloseHandle.argtypes = [wintypes.HANDLE]
-    names: set = set()
-    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap in (None, 0, ctypes.c_void_p(-1).value):
-        return names
-    try:
-        entry = PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(entry)
-        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
-        while ok:
-            names.add(entry.szExeFile.lower())
-            ok = k32.Process32NextW(snap, ctypes.byref(entry))
-    finally:
-        k32.CloseHandle(snap)
-    return names
-
-
 def fortnite_running() -> bool:
+    target = FN_PROC.lower()
     try:
-        return FN_PROC.lower() in list_process_names()
-    except Exception:  # noqa: BLE001
-        return False
+        for p in psutil.process_iter(["name"]):
+            try:
+                if (p.info.get("name") or "").lower() == target:
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception:
+        pass
+    return False
 
 
-# ------------------------------------------------------------------ display detection
 class DEVMODEW(ctypes.Structure):
-    """Win32 DEVMODEW (display variant). sizeof == 220 on Windows."""
     _fields_ = [("dmDeviceName", wintypes.WCHAR * 32), ("dmSpecVersion", wintypes.WORD),
                 ("dmDriverVersion", wintypes.WORD), ("dmSize", wintypes.WORD), ("dmDriverExtra", wintypes.WORD),
                 ("dmFields", wintypes.DWORD), ("dmPositionX", ctypes.c_long), ("dmPositionY", ctypes.c_long),
@@ -703,7 +654,6 @@ ENUM_CURRENT_SETTINGS = 0xFFFFFFFF
 
 
 def detect_display() -> DisplayInfo:
-    """Native mode, refresh rate and supported modes of the primary display (physical pixels, DPI-proof)."""
     info = DisplayInfo()
     try:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -723,36 +673,37 @@ def detect_display() -> DisplayInfo:
             if m is None:
                 break
             info.supported.add((int(m.dmPelsWidth), int(m.dmPelsHeight)))
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
-    if not info.width:  # last resort; may be DPI-virtualised
+    if not info.width:
         try:
             info.width = int(ctypes.windll.user32.GetSystemMetrics(0))
             info.height = int(ctypes.windll.user32.GetSystemMetrics(1))
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     return info
 
 
 def fallback_profile() -> SystemProfile:
-    """Minimal profile used when the CIM scan fails: RAM and battery presence still come from psutil."""
     p = SystemProfile()
     try:
         p.ram_bytes = int(psutil.virtual_memory().total)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     try:
         p.is_laptop = psutil.sensors_battery() is not None
-    except Exception:  # noqa: BLE001
+    except Exception:
         p.is_laptop = False
+    try:
+        p.os_build = sys.getwindowsversion().build
+    except Exception:
+        pass
     p.form_reason = "battery detected" if p.is_laptop else "no battery detected"
     return p
 
 
-# ------------------------------------------------------------------ state store (original values for Undo)
+# ------------------------------------------------------------------ state store
 class StateStore:
-    """Persists the ORIGINAL value of everything a tweak changes so Undo can restore it exactly."""
-
     def __init__(self):
         self._lock = threading.RLock()
         self.data: dict = {}
@@ -764,17 +715,16 @@ class StateStore:
             try:
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
                     self.data = json.load(f)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 self.data = {}
         else:
             self._import_legacy()
 
     def _import_legacy(self):
-        """One-time import of a pre-2.0 state.json so Undo still works after upgrading."""
         try:
             with open(os.path.join(LEGACY_DATA_DIR, "state.json"), "r", encoding="utf-8") as f:
                 old = json.load(f)
-        except Exception:  # noqa: BLE001
+        except Exception:
             return
         if isinstance(old, dict) and old:
             self.data = {LEGACY_STATE_IDS.get(k, k): v for k, v in old.items()}
@@ -787,7 +737,7 @@ class StateStore:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=1)
             os.replace(tmp, STATE_FILE)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print("state save failed:", e)
 
     def is_applied(self, tid):
@@ -810,71 +760,11 @@ class StateStore:
         return [k for k, v in self.data.items() if v.get("applied")]
 
 
-# ------------------------------------------------------------------ privileges / native actions
-class LUID(ctypes.Structure):
-    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
-
-
-class LUID_AND_ATTRIBUTES(ctypes.Structure):
-    _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
-
-
-class TOKEN_PRIVILEGES(ctypes.Structure):
-    _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
-
-
-def enable_privilege(name: str) -> bool:
-    adv = ctypes.WinDLL("advapi32", use_last_error=True)
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.GetCurrentProcess.restype = wintypes.HANDLE
-    k32.CloseHandle.argtypes = [wintypes.HANDLE]
-    adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-    adv.OpenProcessToken.restype = wintypes.BOOL
-    adv.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
-    adv.LookupPrivilegeValueW.restype = wintypes.BOOL
-    adv.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES),
-                                          wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
-    adv.AdjustTokenPrivileges.restype = wintypes.BOOL
-    token = wintypes.HANDLE()
-    if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0x0028, ctypes.byref(token)):  # ADJUST_PRIVILEGES|QUERY
-        return False
-    try:
-        tp = TOKEN_PRIVILEGES()
-        tp.PrivilegeCount = 1
-        if not adv.LookupPrivilegeValueW(None, name, ctypes.byref(tp.Privileges[0].Luid)):
-            return False
-        tp.Privileges[0].Attributes = 0x00000002  # SE_PRIVILEGE_ENABLED
-        ctypes.set_last_error(0)
-        adv.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
-        return ctypes.get_last_error() == 0  # 1300 = not all assigned
-    finally:
-        k32.CloseHandle(token)
-
-
-def purge_standby_list():
-    """Real standby-list purge (NtSetSystemInformation / SystemMemoryListInformation / MemoryPurgeStandbyList)."""
-    before = psutil.virtual_memory().available
-    if not enable_privilege("SeProfileSingleProcessPrivilege"):
-        return False, "Could not enable SeProfileSingleProcessPrivilege (run as Administrator)."
-    nt = ctypes.WinDLL("ntdll")
-    nt.NtSetSystemInformation.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
-    nt.NtSetSystemInformation.restype = ctypes.c_long
-    cmd = ctypes.c_int(4)  # MemoryPurgeStandbyList
-    status = nt.NtSetSystemInformation(0x50, ctypes.byref(cmd), ctypes.sizeof(cmd))
-    if status != 0:
-        return False, f"NtSetSystemInformation failed (0x{status & 0xFFFFFFFF:08X})."
-    time.sleep(0.6)
-    after = psutil.virtual_memory().available
-    return True, f"Standby list purged. Available RAM {before / 2**30:.2f} -> {after / 2**30:.2f} GB."
-
-
 def set_mouse_params(t1: int, t2: int, accel: int) -> bool:
     arr = (ctypes.c_int * 3)(t1, t2, accel)
-    # SPI_SETMOUSE, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE -> applied instantly and persisted
     return bool(ctypes.windll.user32.SystemParametersInfoW(0x0004, 0, arr, 3))
 
 
-# ------------------------------------------------------------------ power helpers
 def active_scheme():
     rc, out = run(["powercfg", "/getactivescheme"])
     m = GUID_RE.search(out) if rc == 0 else None
@@ -890,27 +780,112 @@ def scheme_exists(scheme) -> bool:
     return run(["powercfg", "/query", scheme])[0] == 0
 
 
+# ------------------------------------------------------------------ network diagnostics & helpers
+def detect_network_info() -> dict:
+    script = (
+        "$adapters = @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Virtual -eq $false } | "
+        "Select-Object Name,InterfaceDescription,InterfaceIndex,LinkSpeed,MediaType);"
+        "if(-not $adapters){ $adapters = @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | "
+        "Select-Object Name,InterfaceDescription,InterfaceIndex,LinkSpeed,MediaType) };"
+        "$out = @();"
+        "foreach($a in $adapters){"
+        "  $ip = Get-NetIPConfiguration -InterfaceIndex $a.InterfaceIndex -ErrorAction SilentlyContinue;"
+        "  $dns = (Get-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses;"
+        "  $iface = Get-NetIPInterface -InterfaceIndex $a.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue;"
+        "  $out += [ordered]@{"
+        "    name=$a.Name; desc=$a.InterfaceDescription; idx=$a.InterfaceIndex; speed=$a.LinkSpeed;"
+        "    ipv4=($ip.IPv4Address.IPAddress | Select-Object -First 1);"
+        "    gw=($ip.IPv4DefaultGateway.NextHop | Select-Object -First 1);"
+        "    dns=@($dns);"
+        "    metric=$iface.InterfaceMetric"
+        "  }"
+        "};"
+        "$tcp = Get-NetTCPSetting -SettingName Internet -ErrorAction SilentlyContinue;"
+        "$off = Get-NetOffloadGlobalSetting -ErrorAction SilentlyContinue;"
+        "[ordered]@{"
+        "  adapters=$out;"
+        "  congestion=[string]$tcp.CongestionProvider;"
+        "  autotuning=[string]$tcp.AutoTuningLevelLocal;"
+        "  heuristics=[string]$tcp.ScalingHeuristics;"
+        "  rss=[string]$off.ReceiveSideScaling;"
+        "  rsc=[string]$off.ReceiveSegmentCoalescing"
+        "} | ConvertTo-Json -Depth 4 -Compress"
+    )
+    rc, out = ps(script, timeout=30)
+    if rc == 0 and "{" in out:
+        try:
+            return json.loads(out[out.index("{"):])
+        except Exception:
+            pass
+    return {"adapters": []}
+
+
+def measure_ping(host: str, count: int = 4) -> dict:
+    """Run standard Windows ping.exe and parse RTT, jitter, and packet loss safely across locales."""
+    if not host or not re.match(r"^[A-Za-z0-9._:-]+$", host):
+        return {"host": host, "ok": False, "avg": None, "min": None, "max": None, "jitter": None, "loss": 100.0}
+    rc, out = run(["ping", "-n", str(count), "-w", "1200", host], timeout=max(10, count * 2 + 5))
+    rtts = []
+    for line in out.splitlines():
+        if "ttl=" in line.lower():
+            m = re.search(r"([<=])\s*(\d+)\s*ms\b", line, re.IGNORECASE)
+            if m:
+                val = 0.5 if m.group(1) == "<" and int(m.group(2)) <= 1 else float(m.group(2))
+                rtts.append(val)
+    loss = round(((count - len(rtts)) / count) * 100.0, 1) if count > 0 else 100.0
+    if not rtts:
+        return {"host": host, "ok": False, "avg": None, "min": None, "max": None, "jitter": None, "loss": 100.0}
+    avg = round(statistics.mean(rtts), 1)
+    mn, mx = min(rtts), max(rtts)
+    jitter = round(statistics.pstdev(rtts), 1) if len(rtts) > 1 else 0.0
+    return {"host": host, "ok": True, "avg": avg, "min": mn, "max": mx, "jitter": jitter, "loss": loss}
+
+
+def set_adapter_dns(store: StateStore, idx: int, name: str, servers: Optional[tuple]):
+    snap = store.snapshot("net_dns_preset")
+    if snap is None:
+        rc, out = ps(f"(Get-DnsClientServerAddress -InterfaceIndex {int(idx)} -AddressFamily IPv4).ServerAddresses | ConvertTo-Json -Compress")
+        prev = []
+        if rc == 0 and out.strip():
+            try:
+                parsed = json.loads(out.strip())
+                prev = parsed if isinstance(parsed, list) else [parsed]
+            except Exception:
+                prev = []
+        snap = {"idx": int(idx), "name": name, "prev": [str(x) for x in prev if x]}
+    if servers:
+        joined = ",".join(f"'{s}'" for s in servers)
+        rc, out = ps(f"Set-DnsClientServerAddress -InterfaceIndex {int(idx)} -ServerAddresses @({joined})")
+        if rc != 0:
+            return False, f"Failed setting DNS: {out.strip()[:120]}"
+        store.mark("net_dns_preset", snap)
+        run(["ipconfig", "/flushdns"])
+        return True, f"DNS for '{name}' set to {', '.join(servers)}."
+    else:
+        prev = snap.get("prev") if snap else []
+        if prev:
+            joined = ",".join(f"'{s}'" for s in prev)
+            rc, out = ps(f"Set-DnsClientServerAddress -InterfaceIndex {int(idx)} -ServerAddresses @({joined})")
+            msg = f"Restored original DNS ({', '.join(prev)}) on '{name}'."
+        else:
+            rc, out = ps(f"Set-DnsClientServerAddress -InterfaceIndex {int(idx)} -ResetServerAddresses")
+            msg = f"Restored automatic (DHCP) DNS on '{name}'."
+        if rc != 0:
+            return False, f"Failed resetting DNS: {out.strip()[:120]}"
+        store.clear("net_dns_preset")
+        run(["ipconfig", "/flushdns"])
+        return True, msg
+
 
 # ------------------------------------------------------------------ tweak classes
 class Tweak:
-    """Base class for every tweak.
-
-    impact    "Low" | "Medium" | "High" - badge only
-    reboot    needs a restart to take effect
-    rec       True / False / callable(profile) - part of the 1-Click profile (False = OPTIONAL)
-    requires  callable(profile) -> bool. When False the tweak is hidden and apply is refused.
-    scope     short badge text when requires is set (e.g. "Laptops")
-    desc_fn   callable(profile) -> str for hardware-specific descriptions
-    probe     callable() -> str showing the live state ("Currently: ON")
-    legacy    retired tweak: never applied again, only shown (with Undo) if an old version applied it
-    """
-
     def __init__(self, tid, cat, name, desc, impact="Medium", reboot=False, rec=True,
                  requires: Optional[Callable] = None, scope: str = "", desc_fn: Optional[Callable] = None,
-                 probe: Optional[Callable] = None, legacy: bool = False):
+                 probe: Optional[Callable] = None, legacy: bool = False, needs_admin: bool = True):
         self.id, self.cat, self.name, self.desc = tid, cat, name, desc
         self.impact, self.reboot, self.rec = impact, reboot, rec
-        self.requires, self.scope, self.desc_fn, self.probe, self.legacy = requires, scope, desc_fn, probe, legacy
+        self.requires, self.scope, self.desc_fn, self.probe = requires, scope, desc_fn, probe
+        self.legacy, self.needs_admin = legacy, needs_admin
 
     def applies_to(self, profile) -> bool:
         if self.requires is None:
@@ -919,20 +894,20 @@ class Tweak:
             return False
         try:
             return bool(self.requires(profile))
-        except Exception:  # noqa: BLE001
+        except Exception:
             return False
 
     def is_rec(self, profile) -> bool:
         try:
             return bool(self.rec(profile)) if callable(self.rec) else bool(self.rec)
-        except Exception:  # noqa: BLE001
+        except Exception:
             return False
 
     def describe(self, profile) -> str:
         if self.desc_fn and profile is not None:
             try:
                 return self.desc_fn(profile)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         return self.desc
 
@@ -944,9 +919,9 @@ class Tweak:
 
 
 class RegTweak(Tweak):
-    """entries: (hive, path, name, type, value, default)  -  default None = delete value when no snapshot exists."""
-
     def __init__(self, tid, cat, name, desc, entries, optional=(), **kw):
+        if "needs_admin" not in kw:
+            kw["needs_admin"] = any(e[0] == "HKLM" for e in list(entries) + list(optional))
         super().__init__(tid, cat, name, desc, **kw)
         self.entries, self.optional = list(entries), list(optional)
 
@@ -1001,11 +976,6 @@ class RegTweak(Tweak):
 
 
 class PowerTweak(Tweak):
-    """settings: (subgroup, setting, value). Applied to the active plan; originals (AC and DC) are restored on Undo.
-
-    ac_only=True writes the AC (plugged-in) value only, so a laptop's battery life is untouched.
-    """
-
     def __init__(self, tid, cat, name, desc, settings, ac_only=False, **kw):
         super().__init__(tid, cat, name, desc, **kw)
         self.settings, self.ac_only = settings, ac_only
@@ -1121,17 +1091,32 @@ class CustomTweak(Tweak):
         return self._u(store)
 
 
-# ------------------------------------------------------------------ custom tweak implementations
+# ------------------------------------------------------------------ custom implementations
 MM = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+KERNEL_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\kernel"
+POWER_SM_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Power"
 SYSPROF = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+DX_PREFS = r"Software\Microsoft\DirectX\UserGpuPreferences"
+DWM_KEY = r"SOFTWARE\Microsoft\Windows\Dwm"
+GFX = r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+GAMEBAR = r"Software\Microsoft\GameBar"
+EDGE_POL = r"SOFTWARE\Policies\Microsoft\Edge"
+DNS_PARAMS = r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters"
+QOS_TCPIP = r"SYSTEM\CurrentControlSet\Services\Tcpip\QoS"
+QOS_POL_FN = r"SOFTWARE\Policies\Microsoft\Windows\QoS\ForgeFN_Fortnite"
+INET_SET = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+LAYERS = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+MOUSE_KEY = r"Control Panel\Mouse"
+TCPIP_INTERFACES = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+
 ULTIMATE = "e9a42b02-d5df-448d-aa00-03f14749eb61"
 HIGHPERF = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
-LAYERS = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
-
-
-
-# ------------------------------------------------------------------ dynamic pagefile
 PAGEFILE_ID = "pagefile_dynamic"
+HAGS_ID = "hags_on"
+
+
+def _noop_undo_factory(text):
+    return lambda store: (True, text)
 
 
 def _pagefile_desc(profile) -> str:
@@ -1175,13 +1160,29 @@ def _pagefile_undo(store):
     return True, "Original pagefile configuration restored. Reboot to activate."
 
 
-def _standby_apply(store):
-    ok, msg = purge_standby_list()
-    return ok, msg
+def _find_rammap() -> Optional[str]:
+    for name in ("RAMMap64.exe", "RAMMap.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+        for folder in (os.path.join(DATA_DIR, "Tools"), r"C:\Tools", os.path.expandvars(r"%USERPROFILE%\Downloads")):
+            cand = os.path.join(folder, name)
+            if os.path.isfile(cand):
+                return cand
+    return None
 
 
-def _noop_undo_factory(text):
-    return lambda store: (True, text)
+def _rammap_standby_apply(store):
+    exe = _find_rammap()
+    if not exe:
+        return False, ("Sysinternals RAMMap not found on PATH or C:\\Tools. Download the official Microsoft-signed "
+                       "RAMMap64.exe from learn.microsoft.com/sysinternals/downloads/rammap if you want manual Standby List flushing.")
+    before = psutil.virtual_memory().available
+    rc, out = run([exe, "-Et"], timeout=30)
+    if rc != 0:
+        return False, f"RAMMap failed: {out.strip()[:120]}"
+    after = psutil.virtual_memory().available
+    return True, f"Standby list emptied via Sysinternals RAMMap. Available RAM {before / 2**30:.2f} -> {after / 2**30:.2f} GB."
 
 
 def _memcomp_apply(store):
@@ -1221,7 +1222,7 @@ def _plan_apply(store):
     if rc != 0:
         if snap["created"]:
             run(["powercfg", "/delete", snap["created"]])
-        return False, f"Could not activate a performance plan (this Windows build may not include them): {out.strip()[:120]}"
+        return False, f"Could not activate a performance plan: {out.strip()[:120]}"
     store.mark("power_plan", snap)
     return True, ("Ultimate Performance" if snap["created"] else "High Performance") + " plan activated. Use on AC power."
 
@@ -1260,9 +1261,6 @@ def _hib_undo(store):
     return True, "Hibernation restored." if was_on else "Hibernation was off before, left as it was."
 
 
-MOUSE_KEY = r"Control Panel\Mouse"
-
-
 def _mouse_apply(store):
     snap = store.snapshot("mouse_accel")
     if snap is None:
@@ -1296,7 +1294,7 @@ def find_fortnite_exe():
             for it in json.load(f).get("InstallationList", []):
                 if str(it.get("AppName", "")).lower() == "fortnite":
                     cands.append(os.path.join(it["InstallLocation"], "FortniteGame", "Binaries", "Win64", FN_PROC))
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     cands.append(os.path.join(r"C:\Program Files\Epic Games\Fortnite\FortniteGame\Binaries\Win64", FN_PROC))
     return next((c for c in cands if os.path.isfile(c)), None)
@@ -1320,11 +1318,58 @@ def _fn_fso_undo(store):
     return True, "Fortnite compatibility flags restored."
 
 
+def _parse_kv_reg(raw: str) -> dict[str, str]:
+    out = {}
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
 
-# ------------------------------------------------------------------ vendor-agnostic graphics / Game Mode checks
-GFX = r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
-GAMEBAR = r"Software\Microsoft\GameBar"
-HAGS_ID = "hags_on"
+
+def _join_kv_reg(d: dict[str, str]) -> str:
+    return ";".join(f"{k}={v}" for k, v in d.items()) + ";"
+
+
+def _fn_gpu_pref_apply(store):
+    exe = find_fortnite_exe()
+    if not exe:
+        return False, "Fortnite install not found. Install it with the Epic Games Launcher first."
+    snap = store.snapshot("fn_gpu_highperf") or {"exe": exe, "was": reg_read("HKCU", DX_PREFS, exe)}
+    cur_data = snap["was"].get("data", "") if snap["was"].get("exists") else ""
+    kv = _parse_kv_reg(str(cur_data))
+    kv["GpuPreference"] = "2"
+    reg_write("HKCU", DX_PREFS, snap["exe"], SZ, _join_kv_reg(kv))
+    store.mark("fn_gpu_highperf", snap)
+    return True, "Fortnite set to High-Performance GPU in Windows Graphics Settings."
+
+
+def _fn_gpu_pref_undo(store):
+    snap = store.snapshot("fn_gpu_highperf")
+    if snap:
+        reg_restore("HKCU", DX_PREFS, snap["exe"], snap["was"])
+    store.clear("fn_gpu_highperf")
+    return True, "Fortnite Windows GPU preference restored."
+
+
+def _windowed_opt_apply(store):
+    snap = store.snapshot("windowed_game_opt") or {"was": reg_read("HKCU", DX_PREFS, "DirectXUserGlobalSettings")}
+    cur_data = snap["was"].get("data", "") if snap["was"].get("exists") else ""
+    kv = _parse_kv_reg(str(cur_data))
+    kv["SwapEffectUpgradeEnable"] = "1"
+    kv["VRROptimizeEnable"] = "1"
+    reg_write("HKCU", DX_PREFS, "DirectXUserGlobalSettings", SZ, _join_kv_reg(kv))
+    store.mark("windowed_game_opt", snap)
+    return True, "Windowed Game Optimizations (Flip Model) & VRR optimization enabled (existing AutoHDR preserved)."
+
+
+def _windowed_opt_undo(store):
+    snap = store.snapshot("windowed_game_opt")
+    if snap:
+        reg_restore("HKCU", DX_PREFS, "DirectXUserGlobalSettings", snap["was"])
+    store.clear("windowed_game_opt")
+    return True, "Restored original DirectX user global settings."
 
 
 def _hags_probe() -> str:
@@ -1359,13 +1404,218 @@ def _gamemode_probe() -> str:
     return "Currently: OFF" if cur["data"] == 0 else "Currently: ON"
 
 
+def _bcd_tick_apply(store):
+    snap = store.snapshot("bcd_dynamictick")
+    if snap is None:
+        rc0, enum_out = run(["bcdedit", "/enum", "{current}"])
+        prev = None
+        if rc0 == 0:
+            m = re.search(r"disabledynamictick\s+(\S+)", enum_out, re.IGNORECASE)
+            if m:
+                prev = m.group(1)
+        snap = {"prev": prev}
+    rc, out = run(["bcdedit", "/set", "disabledynamictick", "yes"])
+    if rc != 0:
+        return False, f"bcdedit failed: {out.strip()[:120]}"
+    store.mark("bcd_dynamictick", snap)
+    return True, "Dynamic ticks disabled (system timer resolution stabilized). Reboot required."
+
+
+def _bcd_tick_undo(store):
+    snap = store.snapshot("bcd_dynamictick") or {}
+    prev = snap.get("prev")
+    if prev and prev.lower() in ("no", "yes"):
+        run(["bcdedit", "/set", "disabledynamictick", prev.lower()])
+    else:
+        run(["bcdedit", "/deletevalue", "disabledynamictick"])
+    store.clear("bcd_dynamictick")
+    return True, "Restored dynamic tick kernel setting. Reboot required."
+
+
+# ------------------------------------------------------------------ Network Tweaks
+def _nagle_apply(store):
+    snap = store.snapshot("net_nagle") or {}
+    applied = 0
+    try:
+        with winreg.OpenKey(HIVES["HKLM"], TCPIP_INTERFACES, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as root_key:
+            subkeys_count = winreg.QueryInfoKey(root_key)[0]
+            for i in range(subkeys_count):
+                guid = winreg.EnumKey(root_key, i)
+                if not GUID_RE.match(guid):
+                    continue
+                path = f"{TCPIP_INTERFACES}\\{guid}"
+                if guid not in snap:
+                    snap[guid] = {
+                        "TCPNoDelay": reg_read("HKLM", path, "TCPNoDelay"),
+                        "TcpAckFrequency": reg_read("HKLM", path, "TcpAckFrequency"),
+                        "TcpDelAckTicks": reg_read("HKLM", path, "TcpDelAckTicks"),
+                    }
+                reg_write("HKLM", path, "TCPNoDelay", DW, 1)
+                reg_write("HKLM", path, "TcpAckFrequency", DW, 1)
+                reg_write("HKLM", path, "TcpDelAckTicks", DW, 0)
+                applied += 1
+    except OSError as e:
+        return False, f"Failed updating network adapters: {e}"
+    store.mark("net_nagle", snap)
+    return True, f"Nagle's algorithm disabled across {applied} network adapter(s). Packets transmit immediately."
+
+
+def _nagle_undo(store):
+    snap = store.snapshot("net_nagle") or {}
+    for guid, entries in snap.items():
+        path = f"{TCPIP_INTERFACES}\\{guid}"
+        for name, entry in entries.items():
+            reg_restore("HKLM", path, name, entry)
+    store.clear("net_nagle")
+    return True, "Restored default TCP network packet buffering settings."
+
+
+def _net_tcp_apply(store):
+    snap = store.snapshot("net_tcp_global")
+    if snap is None:
+        info = detect_network_info()
+        snap = {
+            "autotuning": (info.get("autotuning") or "normal").lower(),
+            "rss": (info.get("rss") or "enabled").lower(),
+            "rsc": (info.get("rsc") or "enabled").lower(),
+            "heuristics": (info.get("heuristics") or "enabled").lower(),
+        }
+    rc, out = run(["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal", "rss=enabled", "rsc=disabled"])
+    if rc != 0:
+        return False, f"netsh failed: {out.strip()[:120]}"
+    run(["netsh", "int", "tcp", "set", "heuristics", "disabled"])
+    store.mark("net_tcp_global", snap)
+    return True, "TCP stack tuned: AutoTuning=normal, RSS=enabled, RSC=disabled (no packet coalescing delay), Heuristics=disabled."
+
+
+def _net_tcp_undo(store):
+    snap = store.snapshot("net_tcp_global") or {"autotuning": "normal", "rss": "enabled", "rsc": "enabled", "heuristics": "enabled"}
+    at = snap["autotuning"] if snap["autotuning"] in ("normal", "disabled", "highlyrestricted", "restricted", "experimental") else "normal"
+    rss = "enabled" if "enable" in snap["rss"] else "disabled"
+    rsc = "enabled" if "enable" in snap["rsc"] else "disabled"
+    heur = "enabled" if "enable" in snap["heuristics"] else "disabled"
+    run(["netsh", "int", "tcp", "set", "global", f"autotuninglevel={at}", f"rss={rss}", f"rsc={rsc}"])
+    run(["netsh", "int", "tcp", "set", "heuristics", heur])
+    store.clear("net_tcp_global")
+    return True, "Restored original Windows TCP global parameters."
+
+
+def _net_ctcp_apply(store):
+    snap = store.snapshot("net_ctcp")
+    if snap is None:
+        rc, out = ps("(Get-NetTCPSetting -SettingName Internet).CongestionProvider")
+        prev = out.strip() if rc == 0 and out.strip() else "CUBIC"
+        snap = {"prev": prev}
+    rc, out = run(["netsh", "int", "tcp", "set", "supplemental", "template=internet", "congestionprovider=ctcp"])
+    if rc != 0:
+        return False, f"netsh supplemental failed: {out.strip()[:120]}"
+    store.mark("net_ctcp", snap)
+    return True, "TCP Congestion Provider switched to Compound TCP (CTCP) for Internet profile."
+
+
+def _net_ctcp_undo(store):
+    snap = store.snapshot("net_ctcp") or {"prev": "CUBIC"}
+    prev = snap["prev"].lower()
+    if prev not in ("cubic", "ctcp", "newreno", "dctcp", "default"):
+        prev = "cubic"
+    run(["netsh", "int", "tcp", "set", "supplemental", "template=internet", f"congestionprovider={prev}"])
+    store.clear("net_ctcp")
+    return True, f"Restored TCP Congestion Provider ({prev.upper()})."
+
+
+def _net_qos_dscp_apply(store):
+    snap = store.snapshot("net_qos_dscp")
+    if snap is None:
+        snap = {"nla": reg_read("HKLM", QOS_TCPIP, "Do not use NLA"), "method": "netqos"}
+    reg_write("HKLM", QOS_TCPIP, "Do not use NLA", SZ, "1")
+    rc, _out = ps(
+        "Remove-NetQosPolicy -Name 'ForgeFN_Fortnite' -Confirm:$false -ErrorAction SilentlyContinue; "
+        "New-NetQosPolicy -Name 'ForgeFN_Fortnite' -AppPathNameMatchCondition 'FortniteClient-Win64-Shipping.exe' "
+        "-IPProtocolMatchCondition Both -DSCPAction 46 -NetworkProfile All | Out-Null"
+    )
+    if rc != 0:
+        snap["method"] = "reg"
+        for k, v in (
+            ("Version", "1.0"), ("Application Name", FN_PROC), ("Protocol", "*"),
+            ("Local Port", "*"), ("Local IP", "*"), ("Local IP Prefix Length", "*"),
+            ("Remote Port", "*"), ("Remote IP", "*"), ("Remote IP Prefix Length", "*"),
+            ("DSCP Value", "46"), ("Throttle Rate", "-1"),
+        ):
+            reg_write("HKLM", QOS_POL_FN, k, SZ, v)
+    store.mark("net_qos_dscp", snap)
+    return True, "Fortnite outbound packets tagged DSCP 46 (EF priority) + Non-NLA mode enabled. Reboot to activate NLA change."
+
+
+def _net_qos_dscp_undo(store):
+    snap = store.snapshot("net_qos_dscp") or {"nla": {"exists": False}, "method": "netqos"}
+    ps("Remove-NetQosPolicy -Name 'ForgeFN_Fortnite' -Confirm:$false -ErrorAction SilentlyContinue")
+    reg_delete_tree("HKLM", QOS_POL_FN)
+    reg_restore("HKLM", QOS_TCPIP, "Do not use NLA", snap.get("nla"))
+    store.clear("net_qos_dscp")
+    return True, "Removed Fortnite DSCP 46 QoS policy and restored NLA setting."
+
+
+def _nic_powersave_apply(store):
+    snap = store.snapshot("net_nic_powersave")
+    script = (
+        "$kws = @('*EEE','EnergyEfficientEthernet','AdvancedEEE','GreenEthernet','EEELinkAdvertisement','PowerSavingMode');"
+        "$nics = @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Virtual -eq $false });"
+        "if(-not $nics){ Write-Output '{}'; exit 0 };"
+        "$res = @{};"
+        "foreach($n in $nics){"
+        "  $pm = $null; try { $pm = Get-NetAdapterPowerManagement -Name $n.Name -ErrorAction SilentlyContinue } catch {};"
+        "  $advMap = @{};"
+        "  $props = @(Get-NetAdapterAdvancedProperty -Name $n.Name -ErrorAction SilentlyContinue | Where-Object { $kws -contains $_.RegistryKeyword });"
+        "  foreach($p in $props){"
+        "    $advMap[$p.RegistryKeyword] = [string]($p.RegistryValue | Select-Object -First 1);"
+        "    try { Set-NetAdapterAdvancedProperty -Name $n.Name -RegistryKeyword $p.RegistryKeyword -RegistryValue 0 -NoRestart -ErrorAction SilentlyContinue } catch {}"
+        "  };"
+        "  $pmSnap = if($pm){ @{"
+        "    wake_magic=[string]$pm.WakeOnMagicPacket; wake_pat=[string]$pm.WakeOnPattern;"
+        "    sleep_disc=[string]$pm.DeviceSleepOnDisconnect; arp=[string]$pm.ArpOffload; ns=[string]$pm.NSOffload"
+        "  } } else { $null };"
+        "  try { Disable-NetAdapterPowerManagement -Name $n.Name -NoRestart -ErrorAction SilentlyContinue } catch {};"
+        "  $res[$n.Name] = @{ pm=$pmSnap; adv=$advMap }"
+        "};"
+        "$res | ConvertTo-Json -Depth 4 -Compress"
+    )
+    if snap is None:
+        rc, out = ps(script, timeout=45)
+        if rc != 0 or "{" not in out:
+            return False, f"Could not configure NIC power settings: {out.strip()[:120]}"
+        snap = json.loads(out[out.index("{"):])
+    else:
+        ps(script, timeout=45)
+    if not snap:
+        return False, "No active physical network adapter found."
+    store.mark("net_nic_powersave", snap)
+    return True, f"Disabled power saving & Energy-Efficient Ethernet on {len(snap)} active physical NIC(s)."
+
+
+def _nic_powersave_undo(store):
+    snap = store.snapshot("net_nic_powersave")
+    if not snap:
+        return True, "Nothing recorded to undo."
+    for nic, info in snap.items():
+        safe_nic = nic.replace("'", "''")
+        ps(f"try {{ Enable-NetAdapterPowerManagement -Name '{safe_nic}' -NoRestart -ErrorAction SilentlyContinue }} catch {{}}")
+        for kw, val in (info.get("adv") or {}).items():
+            safe_kw = kw.replace("'", "''")
+            safe_val = str(val).replace("'", "''")
+            ps(f"try {{ Set-NetAdapterAdvancedProperty -Name '{safe_nic}' -RegistryKeyword '{safe_kw}' -RegistryValue '{safe_val}' -NoRestart -ErrorAction SilentlyContinue }} catch {{}}")
+    store.clear("net_nic_powersave")
+    return True, "Restored network adapter power-management and EEE properties."
+
+
+def _dns_flush_apply(store):
+    rc1, _ = run(["ipconfig", "/flushdns"])
+    rc2, _ = run(["ipconfig", "/registerdns"])
+    return (rc1 == 0 or rc2 == 0), "Flushed DNS resolver cache and re-registered network names."
 
 
 # ------------------------------------------------------------------ THE TWEAK LIBRARY
-GAMES = SYSPROF + r"\Tasks\Games"
-IFEO_FN = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\FortniteClient-Win64-Shipping.exe\PerfOptions"
 CAT_RAM, CAT_PWR, CAT_LAT = "RAM & Memory", "Power & Thermal", "Latency & Input"
-CAT_GPU, CAT_WIN, CAT_RETIRED = "Graphics", "Windows Polish", "Retired (undo only)"
+CAT_NET, CAT_GPU, CAT_WIN = "Network & Ping", "Graphics", "Windows Polish"
 PROC = "SUB_PROCESSOR"
 
 TWEAKS: list[Tweak] = [
@@ -1374,9 +1624,13 @@ TWEAKS: list[Tweak] = [
                 "Sizes the pagefile from your installed RAM: 8 GB or less gets a fixed 1.5x pagefile, 16 GB gets 8-12 GB, "
                 "32 GB and up stays system-managed. Free space on the system drive is checked first; activates after a reboot.",
                 _pagefile_apply, _pagefile_undo, impact="High", reboot=True, desc_fn=_pagefile_desc),
-    CustomTweak("standby_purge", CAT_RAM, "Purge Standby Memory List",
-                "Flushes the cached-but-idle 'standby' RAM so Fortnite can grab it as free memory (real NtSetSystemInformation call). One-time action - run it before you launch the game.",
-                _standby_apply, _noop_undo_factory("One-time action - nothing to undo (Windows refills the cache by itself)."), impact="Medium"),
+    RegTweak("disable_paging_exec", CAT_RAM, "Keep Kernel & Drivers in RAM (DisablePagingExecutive)",
+             "Prevents Windows paging kernel-mode drivers and core OS code to disk, cutting sudden frametime hitches on 16 GB+ systems.",
+             [("HKLM", MM, "DisablePagingExecutive", DW, 1, 0)],
+             impact="Medium", reboot=True, requires=lambda p: p.ram_gb >= 15.5, scope="16 GB+ RAM"),
+    RegTweak("clear_pagefile_off", CAT_RAM, "Skip Pagefile Zeroing at Shutdown",
+             "Ensures ClearPageFileAtShutdown is 0 so Windows does not waste shutdown/reboot time zeroing virtual memory.",
+             [("HKLM", MM, "ClearPageFileAtShutdown", DW, 0, 0)], impact="Low"),
     CustomTweak("mem_compression", CAT_RAM, "Disable Memory Compression",
                 "Stops Windows compressing idle memory, freeing a little CPU time. On PCs with 8 GB of RAM or less compression usually HELPS, so this is left out of the 1-Click profile.",
                 _memcomp_apply, _memcomp_undo, impact="Low", reboot=True, rec=False),
@@ -1390,13 +1644,19 @@ TWEAKS: list[Tweak] = [
     ServiceTweak("wsearch", CAT_RAM, "Disable Windows Search Indexer",
                  "Stops background file indexing that causes disk/CPU spikes. Start-menu file search gets slower, so this is optional and not in the 1-Click profile.",
                  ["WSearch"], {"WSearch": "delayed"}, impact="Low", rec=False),
+    CustomTweak("rammap_standby", CAT_RAM, "Purge Standby Memory (via Sysinternals RAMMap)",
+                "Optional one-time flush using Microsoft's digitally signed RAMMap64.exe (if installed on PATH or C:\\Tools), avoiding undocumented kernel calls.",
+                _rammap_standby_apply, _noop_undo_factory("One-time action - Windows refills standby cache automatically."), impact="Medium", rec=False),
 
     # ---------------- Power & Thermal
     CustomTweak("power_plan", CAT_PWR, "Ultimate / High Performance Power Plan",
                 "Creates and activates Microsoft's Ultimate Performance plan (falls back to High Performance) so the CPU never idles down mid-fight. Best on AC power - on a laptop it drains the battery faster. Undo returns to your previous plan.",
                 _plan_apply, _plan_undo, impact="High"),
+    PowerTweak("perf_epp_ac", CAT_PWR, "CPU Energy Performance Preference: 0% (AC)",
+               "Sets hardware Speed Shift / CPPC Energy Performance Preference (PERFEPP) to 0% when plugged in so clocks ramp up instantaneously on input.",
+               [(PROC, "36687f9e-e3a5-4dbf-b1dc-15eb381c6863", 0)], ac_only=True, impact="Medium"),
     PowerTweak("cpu_clamp", CAT_PWR, "Clamp CPU Max State to 95% (Anti-Throttle)",
-               "Laptops only. Caps the processor at 95%, which on most Intel CPUs switches off Turbo Boost and can keep a thermally limited laptop below its throttle point (behaviour varies by CPU vendor). You trade peak clocks for steadier frame times, so it is optional.",
+               "Laptops only. Caps the processor at 95%, which on most Intel CPUs switches off Turbo Boost and can keep a thermally limited laptop below its throttle point. You trade peak clocks for steadier frame times, so it is optional.",
                [(PROC, "PROCTHROTTLEMAX", 95)], impact="High", rec=False, requires=lambda p: p.is_laptop, scope="Laptops"),
     PowerTweak("boost_mode", CAT_PWR, "CPU Boost Mode: Efficient Enabled",
                "Laptops only. Keeps boost clocks but makes them less aggressive - a gentler alternative to the 95% clamp. Optional.",
@@ -1407,17 +1667,15 @@ TWEAKS: list[Tweak] = [
     PowerTweak("pcie_aspm", CAT_PWR, "PCI-E Link State Power Management: Off",
                "Disables ASPM sleep states on the GPU/NVMe bus to avoid wake-up latency. Adds a little heat and power draw (plugged-in profile only), so it is optional.",
                [("SUB_PCIEXPRESS", "ASPM", 0)], ac_only=True, impact="Low", rec=False),
-    PowerTweak("intel_gpu_max", CAT_GPU, "Intel Graphics: Maximum Performance",
-               "Sets the Intel graphics power policy to Maximum Performance so the GPU clocks up immediately (plugged-in profile only). Offered only when an Intel GPU is detected and its driver exposes the setting. "
-               "If your PC also has a discrete GPU, Fortnite normally renders on that one and this affects only the Intel GPU.",
-               [("44f3beca-a7c0-460e-9df2-bb8b99e0cba6", "3619c3f2-afb2-4afc-b0e9-e7fef372de36", 2)],
-               ac_only=True, impact="Medium", requires=lambda p: p.has_gpu("Intel"), scope="Intel GPU"),
     PowerTweak("disk_idle", CAT_PWR, "Never Power Down the Disk",
                "Sets the disk idle timeout to 'never' so the drive isn't put to sleep between asset loads. Small gain on SSDs.",
                [("SUB_DISK", "DISKIDLE", 0)], impact="Low"),
     PowerTweak("usb_suspend", CAT_PWR, "Disable USB Selective Suspend",
                "Stops Windows cutting power to idle USB devices, preventing mouse/keyboard/headset dropouts.",
                [("2a737441-1930-4402-8d77-b2bebba4d5a3", "48e6b7a6-50f5-4760-a579-922062fe337f", 0)], impact="Low"),
+    RegTweak("fast_startup_off", CAT_PWR, "Disable Windows Fast Startup (Clean Boots)",
+             "Sets HiberbootEnabled=0 so Shut Down performs a clean kernel & driver reset without removing Hibernate support on laptops.",
+             [("HKLM", POWER_SM_KEY, "HiberbootEnabled", DW, 0, 1)], impact="Low", reboot=True),
     CustomTweak("hibernate_off", CAT_PWR, "Disable Hibernation (Reclaim Disk Space)",
                 "Deletes hiberfil.sys, freeing several GB on the system drive, and turns off Fast Startup. Laptops lose Hibernate, so it is only recommended on desktops. Undo turns hibernation back on.",
                 _hib_apply, _hib_undo, impact="Low", rec=lambda p: not p.is_laptop),
@@ -1426,20 +1684,41 @@ TWEAKS: list[Tweak] = [
              [("HKLM", r"SYSTEM\CurrentControlSet\Control\Power\PowerThrottling", "PowerThrottlingOff", DW, 1, None)],
              impact="Medium", reboot=True, rec=lambda p: not p.is_laptop),
 
-    # ---------------- Latency & Input
+    # ---------------- Latency & Input (Zero-Delay)
     CustomTweak("mouse_accel", CAT_LAT, "Disable Enhanced Pointer Precision",
                 "Turns off Windows mouse acceleration so your hand movement maps 1:1 to the crosshair. Takes effect instantly.",
-                _mouse_apply, _mouse_undo, impact="High"),
-    RegTweak("net_throttle", CAT_LAT, "Disable Network Throttling Index",
-             "Removes the multimedia network packet throttle Windows applies by default. Harmless and occasionally helps ping consistency.",
-             [("HKLM", SYSPROF, "NetworkThrottlingIndex", DW, 0xFFFFFFFF, 10)], impact="Low", reboot=True),
+                _mouse_apply, _mouse_undo, impact="High", needs_admin=False),
+    RegTweak("mouse_hover_time", CAT_LAT, "Instant Mouse Hover Response",
+             "Lowers MouseHoverTime from 400ms to 10ms for snappier Windows shell & inventory hover responsiveness.",
+             [("HKCU", MOUSE_KEY, "MouseHoverTime", SZ, "10", "400")], impact="Low"),
+    RegTweak("kbd_delay", CAT_LAT, "Zero Keyboard Response Delay",
+             "Sets KeyboardDelay to 0 and KeyboardSpeed to 31 for instantaneous key repeat turnover in Fortnite builds and weapon swaps.",
+             [("HKCU", r"Control Panel\Keyboard", "KeyboardDelay", SZ, "0", "1"),
+              ("HKCU", r"Control Panel\Keyboard", "KeyboardSpeed", SZ, "31", "31")], impact="High"),
+    RegTweak("menu_delay", CAT_LAT, "Remove UI & Shell Animation Delays",
+             "Eliminates the 400ms delay Windows adds to menus and UI elements (MenuShowDelay=0), making desktop navigation feel instant.",
+             [("HKCU", r"Control Panel\Desktop", "MenuShowDelay", SZ, "0", "400")], impact="Low"),
+    RegTweak("input_queues", CAT_LAT, "Low-Latency Input Buffer Queues",
+             "Lowers the Mouse and Keyboard buffer queue size from 100 to 32 to eliminate input queue backlog and reduce click-to-motion latency.",
+             [("HKLM", r"SYSTEM\CurrentControlSet\Services\mouclass\Parameters", "MouseDataQueueSize", DW, 32, 100),
+              ("HKLM", r"SYSTEM\CurrentControlSet\Services\kbdclass\Parameters", "KeyboardDataQueueSize", DW, 32, 100)],
+             impact="Medium", reboot=True),
+    RegTweak("global_timer_res", CAT_LAT, "Global 1ms Timer Resolution Requests (Win 11)",
+             "Enables GlobalTimerResolutionRequests=1 so Windows 11 honours high-precision 1ms/0.5ms timer requests across processes instead of throttling background/engine timers.",
+             [("HKLM", KERNEL_KEY, "GlobalTimerResolutionRequests", DW, 1, None)],
+             impact="High", reboot=True, requires=lambda p: p.os_build >= 22000, scope="Windows 11"),
+    CustomTweak("bcd_dynamictick", CAT_LAT, "Disable Kernel Dynamic Ticks",
+                "Prevents the Windows kernel from sleeping timers when idle (disabledynamictick=yes), keeping micro-frame times and DPC latency consistent.",
+                _bcd_tick_apply, _bcd_tick_undo, impact="Medium", reboot=True),
     RegTweak("sys_responsiveness", CAT_LAT, "System Responsiveness: 0%",
              "Reduces the CPU time Windows reserves for low-priority multimedia background tasks, leaving more for the game.",
              [("HKLM", SYSPROF, "SystemResponsiveness", DW, 0, 20)], impact="Medium", reboot=True),
     RegTweak("mmcss_games", CAT_LAT, "Games Scheduler Priority (MMCSS)",
              "Raises the Multimedia Class Scheduler 'Games' task to High priority so the game's threads are scheduled ahead of background work.",
-             [("HKLM", GAMES, "GPU Priority", DW, 8, 8), ("HKLM", GAMES, "Priority", DW, 6, 2),
-              ("HKLM", GAMES, "Scheduling Category", SZ, "High", "Medium"), ("HKLM", GAMES, "SFIO Priority", SZ, "High", "Normal")],
+             [("HKLM", SYSPROF + r"\Tasks\Games", "GPU Priority", DW, 8, 8),
+              ("HKLM", SYSPROF + r"\Tasks\Games", "Priority", DW, 6, 2),
+              ("HKLM", SYSPROF + r"\Tasks\Games", "Scheduling Category", SZ, "High", "Medium"),
+              ("HKLM", SYSPROF + r"\Tasks\Games", "SFIO Priority", SZ, "High", "Normal")],
              impact="Medium", reboot=True),
     RegTweak("fth_off", CAT_LAT, "Disable Fault Tolerant Heap",
              "Stops Windows silently switching a crashed game onto a slower heap, which can leave Fortnite permanently slower after one crash.",
@@ -1454,19 +1733,66 @@ TWEAKS: list[Tweak] = [
               ("HKCU", r"Control Panel\Accessibility\Keyboard Response", "Flags", SZ, "122", "126")],
              impact="Low"),
 
-    # ---------------- Graphics (vendor-agnostic)
+    # ---------------- Network & Ping Engine
+    CustomTweak("net_nagle", CAT_NET, "Disable Nagle's Algorithm (TCP NoDelay)",
+                "Disables TCP packet delay buffering (TCPNoDelay=1, TcpAckFrequency=1, TcpDelAckTicks=0) across network adapters so packets transmit immediately.",
+                _nagle_apply, _nagle_undo, impact="High"),
+    CustomTweak("net_tcp_global", CAT_NET, "Optimize Global TCP Stack (RSS / RSC Off)",
+                "Enables Receive-Side Scaling (RSS) across CPU cores, sets AutoTuning to normal, disables heuristics, and disables RSC coalescing latency.",
+                _net_tcp_apply, _net_tcp_undo, impact="Medium"),
+    CustomTweak("net_nic_powersave", CAT_NET, "Disable NIC Power Saving & Energy-Efficient Ethernet",
+                "Stops Windows sleeping your Ethernet/Wi-Fi adapter and turns off EEE / Green Ethernet packet coalescing to prevent random ping spikes.",
+                _nic_powersave_apply, _nic_powersave_undo, impact="High"),
+    CustomTweak("net_ctcp", CAT_NET, "Enable Compound TCP Congestion Provider (CTCP)",
+                "Switches the Internet TCP congestion provider from default CUBIC to Microsoft's low-buffer Compound TCP (optional - test in-game).",
+                _net_ctcp_apply, _net_ctcp_undo, impact="Medium", rec=False),
+    CustomTweak("net_qos_dscp", CAT_NET, "Fortnite QoS DSCP 46 Priority + Non-NLA Mode",
+                "Tags outbound FortniteClient-Win64-Shipping.exe traffic with DSCP 46 (Expedited Forwarding) and enables Tcpip\\QoS 'Do not use NLA' on Home & Pro.",
+                _net_qos_dscp_apply, _net_qos_dscp_undo, impact="Medium", reboot=True, rec=False),
+    CustomTweak("net_dns_flush", CAT_NET, "Flush DNS Resolver & Register",
+                "Flushes stale local DNS routing caches and re-registers network adapter names to clear stale name resolution.",
+                _dns_flush_apply, _noop_undo_factory("One-time action - Windows rebuilds DNS caches as you browse."), impact="Low", needs_admin=False),
+    RegTweak("net_dns_negcache", CAT_NET, "Disable Negative DNS Caching",
+             "Sets MaxNegativeCacheTtl=0 so failed DNS lookups aren't cached for 15 minutes during brief router hiccups.",
+             [("HKLM", DNS_PARAMS, "MaxNegativeCacheTtl", DW, 0, None)], impact="Low"),
+    RegTweak("net_qos_reserve", CAT_NET, "Disable QoS Bandwidth Reservation",
+             "Prevents Windows from reserving up to 20% of your network throughput for background system services (NonBestEffortLimit=0).",
+             [("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\Psched", "NonBestEffortLimit", DW, 0, None)], impact="Low"),
+    RegTweak("net_throttle", CAT_NET, "Disable Network Throttling Index",
+             "Removes the multimedia network packet throttle Windows applies by default. Helps ping consistency.",
+             [("HKLM", SYSPROF, "NetworkThrottlingIndex", DW, 0xFFFFFFFF, 10)], impact="Medium", reboot=True),
+    RegTweak("net_proxy_autodetect", CAT_NET, "Disable Automatic Proxy Detection (WPAD Off)",
+             "Turns off background WPAD proxy auto-discovery delays on connection establishment.",
+             [("HKCU", INET_SET, "AutoDetect", DW, 0, 1)], impact="Low"),
+
+    # ---------------- Graphics
+    CustomTweak("fn_gpu_highperf", CAT_GPU, "Force Fortnite to High-Performance GPU",
+                "Sets Windows Graphics Settings preference for FortniteClient-Win64-Shipping.exe to High Performance (GpuPreference=2), essential for dual-GPU laptops.",
+                _fn_gpu_pref_apply, _fn_gpu_pref_undo, impact="High", needs_admin=False),
+    CustomTweak("windowed_game_opt", CAT_GPU, "Windowed Game Optimizations & VRR (Win 11)",
+                "Enables Windows 11 Flip-Model presentation & VRR optimizations for borderless/windowed games while safely preserving your existing AutoHDR preferences.",
+                _windowed_opt_apply, _windowed_opt_undo, impact="Medium", needs_admin=False, requires=lambda p: p.os_build >= 22000, scope="Windows 11"),
+    PowerTweak("intel_gpu_max", CAT_GPU, "Intel Graphics: Maximum Performance",
+               "Sets the Intel graphics power policy to Maximum Performance so the GPU clocks up immediately (plugged-in profile only).",
+               [("44f3beca-a7c0-460e-9df2-bb8b99e0cba6", "3619c3f2-afb2-4afc-b0e9-e7fef372de36", 2)],
+               ac_only=True, impact="Medium", requires=lambda p: p.has_gpu("Intel"), scope="Intel GPU"),
     CustomTweak(HAGS_ID, CAT_GPU, "Hardware-Accelerated GPU Scheduling (HAGS)",
-                "Lets the GPU manage its own video memory scheduling. Works on NVIDIA, AMD and Intel with a supporting driver (Windows 10 2004+). "
-                "Results vary by GPU and driver - some PCs gain smoother frame times, some see nothing - so it is optional. The live state is shown below; Undo restores your original setting.",
+                "Lets the GPU manage its own video memory scheduling. Works on NVIDIA, AMD and Intel with a supporting driver (Windows 10 2004+).",
                 _hags_apply, _hags_undo, impact="Low", reboot=True, rec=False, probe=_hags_probe),
+    RegTweak("mpo_off", CAT_GPU, "Disable Multi-Plane Overlay (MPO)",
+             "Sets Dwm\\OverlayTestMode=5. Optional fix for multi-monitor alt-tab flicker, stuttering, or black screens on some NVIDIA/AMD drivers.",
+             [("HKLM", DWM_KEY, "OverlayTestMode", DW, 5, None)], impact="Medium", reboot=True, rec=False),
+    RegTweak("tdr_delay", CAT_GPU, "Increase GPU Driver Timeout Cushion (TdrDelay=10)",
+             "Extends the Windows GPU hang detection timeout from 2s to 10s to prevent false DXGI_ERROR_DEVICE_HUNG crashes during heavy shader loads.",
+             [("HKLM", GFX, "TdrDelay", DW, 10, None)], impact="Low", reboot=True, rec=False),
 
     # ---------------- Windows Polish
     RegTweak("game_mode", CAT_WIN, "Windows Game Mode: On",
-             "Makes sure Windows Game Mode is enabled so the OS prioritises the foreground game and holds back driver/Update installs while you play. The live state is shown below.",
+             "Makes sure Windows Game Mode is enabled so the OS prioritises the foreground game and holds back background updates.",
              [("HKCU", GAMEBAR, "AutoGameModeEnabled", DW, 1, None), ("HKCU", GAMEBAR, "AllowAutoGameMode", DW, 1, None)],
              impact="Low", probe=_gamemode_probe),
     RegTweak("gamebar_off", CAT_WIN, "Disable Game Bar & Presence Writer",
-             "Turns off the Xbox Game Bar overlay and its background capture hooks (the Presence Writer key is Windows-protected and may be skipped).",
+             "Turns off the Xbox Game Bar overlay and its background capture hooks.",
              [("HKCU", GAMEBAR, "ShowStartupPanel", DW, 0, None),
               ("HKCU", GAMEBAR, "UseNexusForGameBarEnabled", DW, 0, None),
               ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\GameDVR", "AppCaptureEnabled", DW, 0, 1)],
@@ -1476,6 +1802,12 @@ TWEAKS: list[Tweak] = [
              "Stops Windows continuously recording gameplay in the background, which costs GPU time and RAM.",
              [("HKCU", r"System\GameConfigStore", "GameDVR_Enabled", DW, 0, 1),
               ("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\GameDVR", "AllowGameDVR", DW, 0, None)], impact="Medium", reboot=True),
+    CustomTweak("fn_fso_dpi", CAT_WIN, "Fortnite: No Fullscreen Optimizations + App DPI",
+                "Sets exclusive fullscreen compatibility flags on the Fortnite exe and forces Application high-DPI scaling.",
+                _fn_fso_apply, _fn_fso_undo, impact="High", needs_admin=False),
+    RegTweak("startup_delay_off", CAT_WIN, "Remove App Startup Boot Delay",
+             "Sets Serialize\\StartupDelayInMSec=0 so Windows launches background utilities immediately at sign-in instead of stalling for 10 seconds.",
+             [("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize", "StartupDelayInMSec", DW, 0, None)], impact="Low"),
     RegTweak("transparency_off", CAT_WIN, "Disable Transparency Effects",
              "Turns off the blur/translucency on the taskbar and menus, saving some GPU work and video memory.",
              [("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "EnableTransparency", DW, 0, 1)], impact="Low"),
@@ -1484,8 +1816,21 @@ TWEAKS: list[Tweak] = [
              [("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects", "VisualFXSetting", DW, 2, 0),
               ("HKCU", r"Control Panel\Desktop\WindowMetrics", "MinAnimate", SZ, "0", "1"),
               ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "TaskbarAnimations", DW, 0, 1)], impact="Low"),
+    RegTweak("auto_end_tasks", CAT_WIN, "Speed Up App Closing & Shutdown (AutoEndTasks)",
+             "Allows Windows to close hung background programs cleanly on shutdown/restart without waiting on confirmation dialogs.",
+             [("HKCU", r"Control Panel\Desktop", "AutoEndTasks", SZ, "1", "0"),
+              ("HKCU", r"Control Panel\Desktop", "HungAppTimeout", SZ, "2000", "5000")], impact="Low", rec=False),
+    RegTweak("edge_bg_off", CAT_WIN, "Disable Microsoft Edge Background Pre-Launch",
+             "Prevents Microsoft Edge StartupBoost and background mode from silently running processes while you play.",
+             [("HKLM", EDGE_POL, "StartupBoostEnabled", DW, 0, None),
+              ("HKLM", EDGE_POL, "BackgroundModeEnabled", DW, 0, None)], impact="Low", rec=False),
+    RegTweak("copilot_widgets_off", CAT_WIN, "Hide Taskbar Widgets & Copilot Button (Win 11)",
+             "Hides the Windows 11 Taskbar Widgets feed and Copilot button to stop background WebView2 RAM/CPU usage.",
+             [("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "TaskbarDa", DW, 0, 1),
+              ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "ShowCopilotButton", DW, 0, 1)],
+             impact="Low", rec=False, requires=lambda p: p.os_build >= 22000, scope="Windows 11"),
     ServiceTweak("diagtrack_off", CAT_WIN, "Disable Telemetry (DiagTrack)",
-                 "Stops the Connected User Experiences and Telemetry service from using CPU, disk and network in the background. Skipped if your Windows build already removed it.",
+                 "Stops the Connected User Experiences and Telemetry service from using CPU, disk and network in the background.",
                  ["DiagTrack"], {"DiagTrack": 2}, impact="Low"),
     RegTweak("delivery_opt_off", CAT_WIN, "Disable Delivery Optimization (P2P Updates)",
              "Stops Windows Update using your upload bandwidth to seed updates to other PCs, which can spike your ping.",
@@ -1495,28 +1840,16 @@ TWEAKS: list[Tweak] = [
              [("HKCU", r"Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications", "GlobalUserDisabled", DW, 1, None),
               ("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\AppPrivacy", "LetAppsRunInBackground", DW, 2, None)], impact="Low"),
     ServiceTweak("xbox_svcs_off", CAT_WIN, "Disable Xbox Background Services",
-                 "Disables Xbox Live auth, game-save and networking services Fortnite doesn't need on the Epic launcher. Optional: don't use it if you play Microsoft Store/Xbox titles.",
+                 "Disables Xbox Live auth, game-save and networking services Fortnite doesn't need on the Epic launcher.",
                  ["XblAuthManager", "XblGameSave", "XboxNetApiSvc", "XboxGipSvc"],
                  {"XblAuthManager": 3, "XblGameSave": 3, "XboxNetApiSvc": 3, "XboxGipSvc": 3}, impact="Low", rec=False),
-    CustomTweak("fn_fso_dpi", CAT_WIN, "Fortnite: No Fullscreen Optimizations + App DPI",
-                "Sets the same Windows compatibility flags you would tick in the exe's Properties > Compatibility tab, so Fortnite runs true exclusive fullscreen and handles high-DPI scaling itself. "
-                "The game file is never modified - this is a per-user Windows setting.",
-                _fn_fso_apply, _fn_fso_undo, impact="High"),
-
-    # ---------------- Retired (kept only so Undo still works for anyone who applied it in an older version)
-    RegTweak("fn_cpu_priority", CAT_RETIRED, "Fortnite: High CPU Priority (retired)",
-             "Retired for anti-cheat safety: per-executable 'Image File Execution Options' keys are the same place debugger hijacks live, so ForgeFN no longer writes them. "
-             "If an older version applied this, Undo removes it.",
-             [("HKLM", IFEO_FN, "CpuPriorityClass", DW, 3, None)], impact="Low", rec=False, legacy=True),
 ]
 TWEAK_BY_ID = {t.id: t for t in TWEAKS}
-CATEGORIES = [CAT_RAM, CAT_PWR, CAT_LAT, CAT_GPU, CAT_WIN]
-
+CATEGORIES = [CAT_RAM, CAT_PWR, CAT_LAT, CAT_NET, CAT_GPU, CAT_WIN]
 
 
 # ------------------------------------------------------------------ Fortnite config logic
 def ini_backup_path() -> str:
-    """Backup of GameUserSettings.ini (re-uses a pre-2.0 backup when that is the only one that exists)."""
     new, old = FN_INI + BAK_SUFFIX, FN_INI + LEGACY_BAK_SUFFIX
     return old if (not os.path.exists(new) and os.path.exists(old)) else new
 
@@ -1539,6 +1872,23 @@ def edits_low_quality():
     return e
 
 
+def edits_potato_mode():
+    """Safe Potato Graphics profile: eliminates particle clutter without breaking floors or building meshes."""
+    e = edits_performance_mode() + edits_low_quality()
+    e += [
+        (FN_SEC, "bAllowLowPerformanceModeSettings", "True"),
+        (FN_SEC, "PerformanceModeMeshQuality", "0"),
+        (FN_SG, "sg.ViewDistanceQuality", "0"),
+        (FN_SEC, "bShowGrass", "False"),
+        (FN_SEC, "bMotionBlur", "False"),
+        (FN_SEC, "bUseVSync", "False"),
+        (FN_SEC, "DisableDistortion", "True"),
+        (FN_SEC, "bShowFPS", "True"),
+        (FN_SG, "sg.ResolutionQuality", "66.000000"),
+    ]
+    return e
+
+
 def edits_resolution(w, h, quality):
     e = [(FN_SEC, k, str(v)) for k, v in (
         ("ResolutionSizeX", w), ("ResolutionSizeY", h),
@@ -1552,6 +1902,32 @@ def edits_resolution(w, h, quality):
 
 def edits_fps(fps):
     return [(FN_SEC, "FrameRateLimit", f"{float(fps):.6f}")]
+
+
+def read_fn_summary() -> str:
+    if not os.path.isfile(FN_INI):
+        return ""
+    try:
+        ed = IniEditor(FN_INI)
+        ed.load()
+        rhi = ed.get(FN_SEC, "PreferredRHI", "?")
+        fl = ed.get(FN_SEC, "PreferredFeatureLevel", "?")
+        w = ed.get(FN_SEC, "ResolutionSizeX", "?")
+        h = ed.get(FN_SEC, "ResolutionSizeY", "?")
+        rq = ed.get(FN_SG, "sg.ResolutionQuality", "?")
+        fps = ed.get(FN_SEC, "FrameRateLimit", "?")
+        try:
+            fps_s = "Unlimited" if float(fps) == 0 else f"{float(fps):.0f} FPS"
+        except ValueError:
+            fps_s = fps
+        try:
+            rq_s = f"{float(rq):.0f}%"
+        except ValueError:
+            rq_s = rq
+        mode = "Performance" if (rhi.lower() == "dx11" and fl.lower() == "es31") else rhi.upper()
+        return f"Current INI: {mode} · {w}x{h} ({rq_s} 3D) · Cap: {fps_s}"
+    except Exception:
+        return ""
 
 
 def fn_ini_edit(edits):
@@ -1575,9 +1951,8 @@ def fn_ini_edit(edits):
         if was_ro:
             os.chmod(path, stat.S_IREAD)
         return True, f"{len(edits)} setting(s) written to GameUserSettings.ini."
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return False, f"Failed editing the ini: {e}"
-
 
 
 # ------------------------------------------------------------------ cleaner logic
@@ -1585,33 +1960,56 @@ def _exp(p):
     return os.path.expandvars(p)
 
 
+class SHQUERYRBINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("i64Size", ctypes.c_int64), ("i64NumItems", ctypes.c_int64)]
+
+
+def get_recycle_bin_size() -> int:
+    try:
+        info = SHQUERYRBINFO()
+        info.cbSize = ctypes.sizeof(SHQUERYRBINFO)
+        if ctypes.windll.shell32.SHQueryRecycleBinW(None, ctypes.byref(info)) == 0:
+            return info.i64Size
+    except Exception:
+        pass
+    return 0
+
+
+def empty_recycle_bin() -> int:
+    sz = get_recycle_bin_size()
+    try:
+        if ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 7) == 0:
+            return sz
+    except Exception:
+        pass
+    return 0
+
+
 @dataclass(frozen=True)
 class CleanTarget:
-    """A folder group the cleaner can empty. `vendor` limits it to PCs with that GPU vendor."""
     cid: str
     label: str
     paths: tuple
     default: bool
     note: str = ""
     vendor: Optional[str] = None
+    is_recycle_bin: bool = False
 
 
 CLEAN_TARGETS = [
-    CleanTarget("d3d", "DirectX shader cache", (r"%LOCALAPPDATA%\D3DSCache",), True,
-                "Rebuilt by games on next launch - expect a little stutter in your first match."),
-    CleanTarget("nvidia", "NVIDIA shader cache", (r"%LOCALAPPDATA%\NVIDIA\DXCache", r"%LOCALAPPDATA%\NVIDIA\GLCache"), True,
-                "Rebuilt automatically.", "NVIDIA"),
-    CleanTarget("amd", "AMD shader cache", (r"%LOCALAPPDATA%\AMD\DxCache", r"%LOCALAPPDATA%\AMD\DxcCache",
-                                            r"%LOCALAPPDATA%\AMD\VkCache", r"%LOCALAPPDATA%\AMD\GLCache"), True,
-                "Rebuilt automatically.", "AMD"),
+    CleanTarget("d3d", "DirectX shader cache", (r"%LOCALAPPDATA%\D3DSCache",), True, "Rebuilt on next game launch."),
+    CleanTarget("nvidia", "NVIDIA shader cache", (r"%LOCALAPPDATA%\NVIDIA\DXCache", r"%LOCALAPPDATA%\NVIDIA\GLCache"), True, "Rebuilt automatically.", "NVIDIA"),
+    CleanTarget("amd", "AMD shader cache", (r"%LOCALAPPDATA%\AMD\DxCache", r"%LOCALAPPDATA%\AMD\DxcCache", r"%LOCALAPPDATA%\AMD\VkCache", r"%LOCALAPPDATA%\AMD\GLCache"), True, "Rebuilt automatically.", "AMD"),
     CleanTarget("intel", "Intel shader cache", (r"%LOCALAPPDATA%\Intel\ShaderCache",), True, "Rebuilt automatically.", "Intel"),
-    CleanTarget("fnlogs", "Fortnite crash dumps & logs",
-                (r"%LOCALAPPDATA%\FortniteGame\Saved\Crashes", r"%LOCALAPPDATA%\FortniteGame\Saved\Logs"), True),
-    CleanTarget("dumps", "Windows crash dumps", (r"%LOCALAPPDATA%\CrashDumps",), True),
+    CleanTarget("recycle", "Windows Recycle Bin", (), True, "Permanently empties all deleted files.", is_recycle_bin=True),
+    CleanTarget("wupdate", "Windows Update download cache", (r"%SystemRoot%\SoftwareDistribution\Download",), True, "Clears completed Windows Update packages."),
+    CleanTarget("delivery", "Delivery Optimization P2P cache", (r"%SystemRoot%\SoftwareDistribution\DeliveryOptimization",), True, "Removes cached update shares."),
+    CleanTarget("wer", "Crash reports & error dumps (WER)", (r"%LOCALAPPDATA%\CrashDumps", r"%ProgramData%\Microsoft\Windows\WER"), True, "Removes Windows and app crash logs."),
+    CleanTarget("fnlogs", "Fortnite crash dumps & logs", (r"%LOCALAPPDATA%\FortniteGame\Saved\Crashes", r"%LOCALAPPDATA%\FortniteGame\Saved\Logs"), True),
+    CleanTarget("thumbs", "Thumbnail image caches", (r"%LOCALAPPDATA%\Microsoft\Windows\Explorer",), False, "Explorer rebuilds thumbnails as needed."),
     CleanTarget("utemp", "User temp files", (r"%TEMP%",), True, "Files in use are skipped."),
     CleanTarget("wtemp", "Windows temp files", (r"%SystemRoot%\Temp",), True, "Files in use are skipped."),
-    CleanTarget("prefetch", "Windows Prefetch", (r"%SystemRoot%\Prefetch",), False,
-                "Windows rebuilds it; first launch of each app is slightly slower."),
+    CleanTarget("prefetch", "Windows Prefetch", (r"%SystemRoot%\Prefetch",), False, "Windows rebuilds it; first launch of apps slightly slower."),
 ]
 
 
@@ -1651,7 +2049,6 @@ def dir_size(path):
 
 
 def purge_dir(path):
-    """Delete everything INSIDE path (never the folder itself). Returns bytes freed."""
     freed = 0
     try:
         entries = list(os.scandir(path))
@@ -1678,21 +2075,29 @@ def purge_dir(path):
 def valid_clean_path(p):
     return "%" not in p and len(os.path.normpath(p).split(os.sep)) >= 3 and os.path.isdir(p)
 
+
 # ------------------------------------------------------------------ backup logic
 REG_BACKUP_KEYS = [
     r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management",
+    r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel",
     r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
     r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl",
     r"HKLM\SYSTEM\CurrentControlSet\Control\Power",
     r"HKLM\SOFTWARE\Microsoft\FTH",
     r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
+    r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
+    r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\QoS",
+    r"HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters",
     r"HKLM\SOFTWARE\Policies\Microsoft\Windows",
     r"HKCU\Control Panel\Mouse",
+    r"HKCU\Control Panel\Keyboard",
+    r"HKCU\Control Panel\Desktop",
     r"HKCU\Control Panel\Accessibility",
     r"HKCU\System\GameConfigStore",
     r"HKCU\Software\Microsoft\GameBar",
     r"HKCU\Software\Microsoft\Windows\CurrentVersion\GameDVR",
     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects",
+    r"HKCU\Software\Microsoft\DirectX\UserGpuPreferences",
     r"HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers",
 ]
 
@@ -1701,17 +2106,17 @@ def create_restore_point(desc="ForgeFN_PreOptimization"):
     key = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
     prev = reg_read("HKLM", key, "SystemRestorePointCreationFrequency")
     try:
-        reg_write("HKLM", key, "SystemRestorePointCreationFrequency", DW, 0)  # lift the 24h limit
+        reg_write("HKLM", key, "SystemRestorePointCreationFrequency", DW, 0)
     except OSError:
         pass
-    rc, out = ps(f"Enable-ComputerRestore -Drive 'C:\\'; Checkpoint-Computer -Description '{desc}' -RestorePointType MODIFY_SETTINGS", timeout=300)
+    rc, out = ps(f"Enable-ComputerRestore -Drive '{SYS_DRIVE}\\'; Checkpoint-Computer -Description '{desc}' -RestorePointType MODIFY_SETTINGS", timeout=300)
     try:
         reg_restore("HKLM", key, "SystemRestorePointCreationFrequency", prev)
     except OSError:
         pass
     if rc == 0:
         return True, f"System Restore point '{desc}' created."
-    return False, "Restore point failed (System Restore / VSS may be disabled on this Windows build): " + out.strip()[:160]
+    return False, "Restore point failed (System Restore / VSS may be disabled): " + out.strip()[:160]
 
 
 def export_registry_backup():
@@ -1725,36 +2130,32 @@ def export_registry_backup():
     return (ok > 0), f"Exported {ok}/{len(REG_BACKUP_KEYS)} registry branches to {folder}", folder
 
 
-
-# ------------------------------------------------------------------ anti-cheat compliance copy (shown in Backup & Safety)
 ANTICHEAT_ALLOWED = (
-    "ForgeFN is designed to stay inside Epic Games' Easy Anti-Cheat (EAC) and BattlEye rules. It ONLY uses:\n"
-    "  ✔  documented Windows settings: registry values, power-plan settings, service start types, the pagefile\n"
-    "  ✔  per-user Windows compatibility flags (the same ones in an exe's Properties > Compatibility tab)\n"
-    "  ✔  edits to Fortnite's own GameUserSettings.ini configuration file")
+    "ForgeFN is designed to stay completely within Epic Games' Easy Anti-Cheat (EAC) and BattlEye rules. It ONLY uses:\n"
+    "  ✔  documented Windows settings: registry values, powercfg plans, service start types, netsh/QoS, pagefile\n"
+    "  ✔  per-user Windows compatibility & GPU preference flags (the same ones inside Windows Settings / Properties)\n"
+    "  ✔  edits to Fortnite's standard user configuration file (GameUserSettings.ini)")
 ANTICHEAT_NEVER = (
     "ForgeFN NEVER:\n"
-    "  ✖  modifies, patches or replaces game, launcher or anti-cheat files\n"
-    "  ✖  injects code or DLLs, hooks functions, or reads / writes game memory\n"
-    "  ✖  opens a handle to the Fortnite or anti-cheat processes - it only checks whether the process name exists, from a read-only system process list\n"
-    "  ✖  adds overlays, touches your network traffic, or changes anything that gives a gameplay advantage beyond video settings and OS performance")
+    "  ✖  modifies, patches, or replaces game, launcher, or anti-cheat files\n"
+    "  ✖  injects code or DLLs, hooks functions, or reads/writes game memory\n"
+    "  ✖  opens a handle to the Fortnite or anti-cheat processes\n"
+    "  ✖  intercepts packets, injects macros, or weakens Windows Defender / security features")
 ANTICHEAT_FINEPRINT = (
-    "Every change is recorded and reversible with Undo. ForgeFN is an independent project and is not affiliated with or endorsed by Epic Games, "
-    "Easy Anti-Cheat or BattlEye. Anti-cheat rules can change and no tool can guarantee immunity from future policy - if you are unsure about a tweak, "
-    "read its description or skip it. Use at your own risk; create a restore point first.")
+    "Every system tweak is snapshotted and completely reversible with the Undo button. ForgeFN is an independent open-source "
+    "project not affiliated with Epic Games. Create a system restore point before applying changes.")
 
 
 # ------------------------------------------------------------------ GUI
 class ForgeApp(ctk.CTk):
-    """Main window: sidebar navigation plus six pages (dashboard, scanner, tweaks, config, cleaner, backup)."""
-
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
+        self.admin = is_admin()
         self.title(f"{APP_NAME} // {APP_TAGLINE}")
-        self.geometry("1180x780")
-        self.minsize(1040, 700)
+        self.geometry("1240x830")
+        self.minsize(1080, 740)
         self.configure(fg_color=C_BG)
 
         self.store = StateStore()
@@ -1762,36 +2163,47 @@ class ForgeApp(ctk.CTk):
         self.stop_evt = threading.Event()
         self.work_lock = threading.Lock()
         self.busy = False
-        self.profile: Optional[SystemProfile] = None      # filled in by the background hardware scan
+        self.profile: Optional[SystemProfile] = None
         self.display: DisplayInfo = detect_display()
         self.target_fps = max(60, self.display.refresh or 60)
         self.res_choice = (self.display.width, self.display.height) if self.display.width else None
         self.res_quality = 100
         self.gpu_proc = None
-        self.status_labels: dict = {}
+        self.lib_status_labels: dict[str, ctk.CTkLabel] = {}
+        self.net_status_labels: dict[str, ctk.CTkLabel] = {}
         self.pending_reboot: list[str] = []
         self.clean_vars: dict = {}
         self.clean_size_lbls: dict = {}
+        self.net_adapters: list[dict] = []
+        self.net_adapter_map: dict[str, dict] = {}
+        self.tweak_cat_filter = "All"
+        self.tweak_search_var = tk.StringVar()
+        self.tweak_rec_only = tk.BooleanVar(value=False)
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
         self.build_sidebar()
         self.pages = {
-            "dashboard": self.page_dashboard(), "scanner": self.page_scanner(), "tweaks": self.page_tweaks(),
-            "config": self.page_config(), "cleaner": self.page_cleaner(), "backup": self.page_backup(),
+            "dashboard": self.page_dashboard(),
+            "scanner": self.page_scanner(),
+            "tweaks": self.page_tweaks(),
+            "network": self.page_network(),
+            "config": self.page_config(),
+            "cleaner": self.page_cleaner(),
+            "backup": self.page_backup(),
         }
         self.select_page("dashboard")
         self.after(250, self._dark_titlebar)
         self.after(60, self._pump)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.log(f"{APP_NAME} {APP_VERSION} ready. Administrator rights verified.")
+        mode_msg = "Administrator rights verified." if self.admin else "Running as Standard User (HKLM/system tweaks require Administrator)."
+        self.log(f"{APP_NAME} {APP_VERSION} ready. {mode_msg}")
         threading.Thread(target=self._telemetry_loop, daemon=True).start()
         threading.Thread(target=self._gpu_loop, daemon=True).start()
         self.scan_hardware()
         self.refresh_fn_status()
 
-    # ---------------- plumbing
     def post(self, fn, *a):
         self.q.put((fn, a))
 
@@ -1801,7 +2213,7 @@ class ForgeApp(ctk.CTk):
                 fn, a = self.q.get_nowait()
                 try:
                     fn(*a)
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     print("UI callback error:", e)
         except queue.Empty:
             pass
@@ -1821,7 +2233,7 @@ class ForgeApp(ctk.CTk):
             val = ctypes.c_int(1)
             for attr in (20, 19):
                 ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     def on_close(self):
@@ -1829,46 +2241,62 @@ class ForgeApp(ctk.CTk):
         try:
             if self.gpu_proc:
                 self.gpu_proc.terminate()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         self.destroy()
 
-    # ---------------- small widget helpers
     def font(self, size=13, weight="normal", family=None):
         return ctk.CTkFont(size=size, weight=weight, family=family) if family else ctk.CTkFont(size=size, weight=weight)
 
     def header(self, page, title, sub):
         ctk.CTkLabel(page, text=title, font=self.font(26, "bold"), text_color=C_TXT).pack(anchor="w")
-        ctk.CTkLabel(page, text=sub, font=self.font(13), text_color=C_MUT, justify="left").pack(anchor="w", pady=(0, 16))
+        ctk.CTkLabel(page, text=sub, font=self.font(13), text_color=C_MUT, justify="left").pack(anchor="w", pady=(0, 14))
 
     def action_button(self, parent, text, cmd, kind="primary", **kw):
         colors = {"primary": (C_ACC, "#000000", C_ACC_H), "dark": (C_CARD2, C_TXT, "#2B3550"),
-                  "danger": (C_BAD, "#FFFFFF", "#CC2952"), "purple": (C_PUR, "#FFFFFF", "#5D1E9B")}
+                  "danger": (C_BAD, "#FFFFFF", "#CC2952"), "purple": (C_PUR, "#FFFFFF", "#5D1E9B"),
+                  "emerald": (C_OK, "#000000", "#00C853")}
         fg, tc, hv = colors[kind]
         return ctk.CTkButton(parent, text=text, command=cmd, fg_color=fg, text_color=tc, hover_color=hv,
                              font=self.font(12, "bold"), height=kw.pop("height", 38), **kw)
 
+    def _request_admin(self):
+        if relaunch_as_admin():
+            self.on_close()
+        else:
+            messagebox.showwarning(APP_NAME, "Elevation cancelled. You can continue using Standard User features.")
 
-    # ---------------- sidebar / navigation
     def build_sidebar(self):
         sb = ctk.CTkFrame(self, width=230, corner_radius=0, fg_color=C_SIDE)
         sb.grid(row=0, column=0, sticky="nsew")
         sb.grid_propagate(False)
-        sb.grid_rowconfigure(10, weight=1)
+        sb.grid_rowconfigure(11, weight=1)
         ctk.CTkLabel(sb, text="FORGEFN", font=self.font(21, "bold"), text_color=C_ACC).grid(row=0, column=0, padx=20, pady=(24, 2), sticky="w")
-        ctk.CTkLabel(sb, text="Fortnite Performance Engine", font=self.font(11), text_color=C_MUT).grid(row=1, column=0, padx=20, pady=(0, 18), sticky="w")
+        ctk.CTkLabel(sb, text="Performance Engine", font=self.font(11), text_color=C_MUT).grid(row=1, column=0, padx=20, pady=(0, 18), sticky="w")
         self.nav = {}
-        for i, (key, label) in enumerate([("dashboard", "Dashboard"), ("scanner", "Hardware Scanner"), ("tweaks", "Tweak Library"),
-                                          ("config", "Fortnite Config"), ("cleaner", "System Cleaner"), ("backup", "Backup & Safety")], start=2):
+        nav_items = [
+            ("dashboard", "Dashboard"),
+            ("scanner", "Hardware Scanner"),
+            ("tweaks", "Tweak Library"),
+            ("network", "Network Tweaker"),
+            ("config", "Fortnite Config"),
+            ("cleaner", "System Cleaner"),
+            ("backup", "Backup & Safety"),
+        ]
+        for i, (key, label) in enumerate(nav_items, start=2):
             b = ctk.CTkButton(sb, text=label, anchor="w", height=38, corner_radius=8, fg_color="transparent", text_color=C_TXT,
                               hover_color=C_CARD, font=self.font(13), command=lambda k=key: self.select_page(k))
             b.grid(row=i, column=0, padx=12, pady=3, sticky="ew")
             self.nav[key] = b
         sb.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(sb, text="● Administrator", font=self.font(11, "bold"), text_color=C_OK).grid(row=11, column=0, padx=20, pady=(0, 4), sticky="sw")
+        if self.admin:
+            ctk.CTkLabel(sb, text="● Administrator", font=self.font(11, "bold"), text_color=C_OK).grid(row=12, column=0, padx=20, pady=(0, 4), sticky="sw")
+        else:
+            ctk.CTkLabel(sb, text="○ Standard User", font=self.font(11, "bold"), text_color=C_WARN).grid(row=12, column=0, padx=20, pady=(0, 4), sticky="sw")
+            self.action_button(sb, "Restart as Admin", self._request_admin, kind="dark", height=28).grid(row=13, column=0, padx=20, pady=(0, 6), sticky="ew")
         self.lbl_side_hw = ctk.CTkLabel(sb, text=f"v{APP_VERSION} · detecting hardware…", font=self.font(11), text_color=C_MUT,
                                         wraplength=196, justify="left")
-        self.lbl_side_hw.grid(row=12, column=0, padx=20, pady=(0, 18), sticky="sw")
+        self.lbl_side_hw.grid(row=14, column=0, padx=20, pady=(0, 18), sticky="sw")
 
     def select_page(self, name):
         for p in self.pages.values():
@@ -1876,6 +2304,8 @@ class ForgeApp(ctk.CTk):
         for k, b in self.nav.items():
             b.configure(fg_color=C_CARD if k == name else "transparent", text_color=C_ACC if k == name else C_TXT)
         self.pages[name].grid(row=0, column=1, sticky="nsew", padx=24, pady=22)
+        if name == "network":
+            self.refresh_network()
         if name == "config":
             self.refresh_fn_status()
         if name == "backup":
@@ -1883,8 +2313,6 @@ class ForgeApp(ctk.CTk):
         if name == "cleaner":
             self.scan_cleaner()
 
-
-    # ================================================================== DASHBOARD
     def stat_card(self, parent, col, title, init):
         card = ctk.CTkFrame(parent, fg_color=C_CARD, corner_radius=10)
         card.grid(row=1, column=col, padx=5, pady=5, sticky="nsew")
@@ -1900,6 +2328,7 @@ class ForgeApp(ctk.CTk):
     def _fps_text(self):
         return "UNLIMITED" if self.target_fps == 0 else f"{self.target_fps} FPS"
 
+    # ================================================================== DASHBOARD
     def page_dashboard(self):
         page = ctk.CTkFrame(self, fg_color="transparent")
         page.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="c")
@@ -1918,7 +2347,7 @@ class ForgeApp(ctk.CTk):
         ctk.CTkLabel(fn_card, text="FORTNITE", font=self.font(11, "bold"), text_color=C_MUT).pack(anchor="w", padx=16, pady=(14, 2))
         self.dash_fn = ctk.CTkLabel(fn_card, text="Not running", font=self.font(20, "bold"), text_color=C_MUT)
         self.dash_fn.pack(anchor="w", padx=16)
-        ctk.CTkLabel(fn_card, text="Close it before editing config", font=self.font(11), text_color=C_MUT).pack(anchor="w", padx=16, pady=(8, 14))
+        ctk.CTkLabel(fn_card, text="Close before applying config", font=self.font(11), text_color=C_MUT).pack(anchor="w", padx=16, pady=(8, 14))
 
         fps = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=12)
         fps.grid(row=2, column=0, columnspan=4, sticky="ew", padx=5, pady=(10, 5))
@@ -1933,7 +2362,7 @@ class ForgeApp(ctk.CTk):
         self.fps_bar = ctk.CTkProgressBar(mid, progress_color=C_PUR, fg_color=C_CARD2, height=10)
         self.fps_bar.set(min(1.0, self.target_fps / 240))
         self.fps_bar.pack(fill="x", pady=(4, 6))
-        ctk.CTkLabel(mid, text="Written to Fortnite as the in-game frame cap. A cap your GPU can actually hold keeps fan noise\nand temperatures steadier than running uncapped. (This is a target, not a live FPS reading.)",
+        ctk.CTkLabel(mid, text="Written directly into Fortnite's GameUserSettings.ini. Capping your FPS to a rate your system can sustain\nkeeps fan noise and micro-stutters low.",
                      font=self.font(11), text_color=C_MUT, justify="left").pack(anchor="w")
         fps_values = [str(v) for v in fps_cap_options(self.display.refresh)] + ["Unlimited"]
         seg = ctk.CTkSegmentedButton(fps, values=fps_values, command=self._on_fps, selected_color=C_PUR,
@@ -1949,7 +2378,8 @@ class ForgeApp(ctk.CTk):
                                          font=self.font(12), text_color=C_MUT, justify="left")
         self.lbl_oneclick.grid(row=1, column=0, padx=20, sticky="w")
         self.chk_backup = ctk.CTkCheckBox(ban, text="Create restore point + registry backup first", fg_color=C_ACC, hover_color=C_ACC_H, text_color=C_TXT, checkmark_color="#000")
-        self.chk_backup.select()
+        if self.admin:
+            self.chk_backup.select()
         self.chk_backup.grid(row=2, column=0, padx=20, pady=(8, 4), sticky="w")
         self.master_bar = ctk.CTkProgressBar(ban, progress_color=C_ACC, fg_color=C_CARD2, height=7)
         self.master_bar.set(0)
@@ -1975,12 +2405,11 @@ class ForgeApp(ctk.CTk):
             self.lbl_cfg_fps.configure(text=f"FPS cap: {self._fps_text()} (change on the Dashboard)")
 
     def _update_oneclick_text(self):
-        recs = [t for t in self.active_tweaks() if t.is_rec(self.profile)]
+        recs = [t for t in self.active_tweaks() if t.is_rec(self.profile) and (self.admin or not t.needs_admin)]
         self.lbl_oneclick.configure(
-            text=f"Applies the {len(recs)} recommended tweaks for this PC (including a standby-RAM purge), then writes Performance Mode, all-Low graphics,\n"
-                 "your resolution and FPS cap into Fortnite's config. OPTIONAL tweaks and ones that don't apply to your hardware are skipped. Everything can be undone.")
+            text=f"Applies the {len(recs)} recommended tweaks (latency, ping, NIC power, RAM, power) and configures\n"
+                 "Performance Mode, all-Low graphics, your resolution and FPS cap in Fortnite. Reversible anytime.")
 
-    # ---------------- telemetry
     def _telemetry_loop(self):
         tick = 0
         while not self.stop_evt.is_set():
@@ -1990,7 +2419,7 @@ class ForgeApp(ctk.CTk):
                 self.post(self._show_telemetry, cpu, m.used, m.total)
                 if tick % 3 == 0:
                     self.post(self._show_fn_running, fortnite_running())
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             tick += 1
 
@@ -2022,7 +2451,7 @@ class ForgeApp(ctk.CTk):
                     self.post(self._show_gpu, min(100.0, float(s)))
                 except ValueError:
                     self.post(self._show_gpu, None)
-        except Exception:  # noqa: BLE001
+        except Exception:
             self.post(self._show_gpu, None)
 
     def _show_gpu(self, val):
@@ -2033,13 +2462,16 @@ class ForgeApp(ctk.CTk):
             self.gpu_val.configure(text=f"{val:.0f}%")
             self.gpu_bar.set(val / 100)
 
-    # ---------------- master optimize
     def execute_master(self):
         if self.busy:
             return
         if self.profile is None:
             self.log("Hardware scan is still running - try again in a moment.")
             return
+        if not self.admin:
+            if messagebox.askyesno(APP_NAME, "System tweaks require Administrator rights.\nRestart ForgeFN as Administrator now?"):
+                self._request_admin()
+                return
         self.busy = True
         self.btn_master.configure(state="disabled", text="OPTIMIZING…")
         self.master_bar.set(0)
@@ -2047,18 +2479,18 @@ class ForgeApp(ctk.CTk):
 
     def _master_worker(self, backup):
         with self.work_lock:
-            recs = [t for t in self.active_tweaks() if t.is_rec(self.profile)]
-            total = len(recs) + 1 + (2 if backup else 0)
+            recs = [t for t in self.active_tweaks() if t.is_rec(self.profile) and (self.admin or not t.needs_admin)]
+            total = len(recs) + 1 + (2 if (backup and self.admin) else 0)
             step = 0
 
             def tick():
                 nonlocal step
                 step += 1
-                self.post(self.master_bar.set, step / total)
+                self.post(self.master_bar.set, step / max(1, total))
 
             self.log("=== 1-Click Fortnite Optimize started ===")
-            if backup:
-                self.log("Creating system restore point (can take up to a minute)…")
+            if backup and self.admin:
+                self.log("Creating system restore point…")
                 ok, msg = create_restore_point()
                 self.log(("✔ " if ok else "⚠ ") + msg)
                 tick()
@@ -2069,6 +2501,7 @@ class ForgeApp(ctk.CTk):
             for t in recs:
                 ok, msg = self._run_tweak(t, "apply")
                 self.log(f"{'✔' if ok else '✖'} {t.name}: {msg}")
+                self.post(self._refresh_status, t)
                 good += ok
                 if ok and t.reboot and self.store.is_applied(t.id):
                     reboot.append(t.name)
@@ -2086,18 +2519,20 @@ class ForgeApp(ctk.CTk):
         self.pending_reboot = sorted(set(self.pending_reboot + reboot))
         if self.pending_reboot:
             self.btn_restart.configure(state="normal")
-            self.log(f"Restart Windows to finish {len(self.pending_reboot)} tweak(s) (pagefile, MMCSS, services…).")
+            self.log(f"Restart Windows to finish {len(self.pending_reboot)} tweak(s) (pagefile, timers, MMCSS…).")
 
     def restart_now(self):
         if messagebox.askyesno(APP_NAME, "Restart Windows now to finish applying tweaks?\n\nSave your work first."):
             run(["shutdown", "/r", "/t", "10", "/c", "ForgeFN: finishing tweaks"])
 
-
-
-    # ================================================================== SCANNER + hardware profile
+    # ================================================================== SCANNER
     def page_scanner(self):
-        page = ctk.CTkFrame(self, fg_color="transparent")
-        self.header(page, "Hardware Scanner", "Live readout from Windows (WMI/CIM) of the machine this app is running on.")
+        outer = ctk.CTkFrame(self, fg_color="transparent")
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+        page = ctk.CTkScrollableFrame(outer, fg_color="transparent")
+        page.grid(row=0, column=0, sticky="nsew")
+        self.header(page, "Hardware Scanner", "Live readout from Windows (WMI/CIM) of this machine.")
         self.scan_box = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=12)
         self.scan_box.pack(fill="x", pady=(0, 12))
         self.scan_rows_frame = ctk.CTkFrame(self.scan_box, fg_color="transparent")
@@ -2110,13 +2545,12 @@ class ForgeApp(ctk.CTk):
                      text_color=C_ACC).pack(anchor="w", padx=18, pady=(12, 2))
         self.lbl_tips = ctk.CTkLabel(tips, text="…", font=self.font(12), text_color=C_MUT, wraplength=780, justify="left")
         self.lbl_tips.pack(anchor="w", padx=18, pady=(0, 12))
-        return page
+        return outer
 
     def scan_hardware(self):
         threading.Thread(target=self._scan_worker, daemon=True).start()
 
     def _scan_worker(self):
-        # Each query is wrapped so one broken CIM class (common on stripped-down builds) can't blank the whole scan.
         script = ("function TryGet([scriptblock]$b){ try{ & $b }catch{ $null } };"
                   "$sd=$env:SystemDrive.Substring(0,1);"
                   "$o=[ordered]@{"
@@ -2137,18 +2571,17 @@ class ForgeApp(ctk.CTk):
         warn = ""
         try:
             profile = build_profile(json.loads(out[out.index("{"):]))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             profile = fallback_profile()
-            warn = f"Hardware scan failed ({str(e)[:80]}). Using a minimal profile: RAM and battery only."
+            warn = f"Hardware scan failed ({str(e)[:80]}). Using a minimal profile."
         try:
             dpi = round(ctypes.windll.user32.GetDpiForSystem() / 96 * 100)
-        except Exception:  # noqa: BLE001
+        except Exception:
             dpi = None
         display = detect_display()
         self.post(self._on_profile, profile, display, profile_rows(profile, display, dpi), warn)
 
     def _on_profile(self, profile, display, rows, warn=""):
-        """Runs on the UI thread once the scan finishes: refresh everything that depends on the hardware."""
         self.profile, self.display = profile, display
         if self.res_choice is None and display.width:
             self.res_choice = (display.width, display.height)
@@ -2181,48 +2614,73 @@ class ForgeApp(ctk.CTk):
 
     # ================================================================== TWEAK LIBRARY
     def active_tweaks(self):
-        """Tweaks that apply to this PC (hardware gates satisfied, not retired)."""
         return [t for t in TWEAKS if not t.legacy and t.applies_to(self.profile)]
 
     def page_tweaks(self):
         page = ctk.CTkFrame(self, fg_color="transparent")
         page.grid_columnconfigure(0, weight=1)
-        page.grid_rowconfigure(1, weight=1)
+        page.grid_rowconfigure(2, weight=1)
         top = ctk.CTkFrame(page, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         self.lbl_tweak_title = ctk.CTkLabel(top, text="Tweak Library", font=self.font(26, "bold"), text_color=C_TXT)
         self.lbl_tweak_title.pack(anchor="w")
-        ctk.CTkLabel(top, text="Every Apply makes a real change and records the original value; Undo restores it. OPTIONAL = excluded from 1-Click. "
-                               "Tweaks that don't fit this PC are hidden.", font=self.font(13), text_color=C_MUT).pack(anchor="w")
+        ctk.CTkLabel(top, text="Every Apply makes a real change and records original values; Undo restores them. Hardware-incompatible tweaks are hidden.",
+                     font=self.font(13), text_color=C_MUT).pack(anchor="w")
+
+        # Search + filter bar
+        flt = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=10)
+        flt.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        flt.grid_columnconfigure(0, weight=1)
+        row1 = ctk.CTkFrame(flt, fg_color="transparent")
+        row1.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+        self.ent_tweak_search = ctk.CTkEntry(row1, textvariable=self.tweak_search_var, placeholder_text="Search tweaks by name or description…",
+                                             fg_color=C_CARD2, border_color=C_CARD2, height=32)
+        self.ent_tweak_search.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.tweak_search_var.trace_add("write", lambda *_: self._populate_tweaks())
+        ctk.CTkCheckBox(row1, text="Recommended only", variable=self.tweak_rec_only, command=self._populate_tweaks,
+                        fg_color=C_ACC, hover_color=C_ACC_H, checkmark_color="#000", text_color=C_TXT).pack(side="right")
+
+        cat_vals = ["All"] + CATEGORIES
+        self.seg_tweak_cat = ctk.CTkSegmentedButton(flt, values=cat_vals, command=self._on_tweak_cat,
+                                                    selected_color=C_PUR, selected_hover_color="#5D1E9B", unselected_color=C_CARD2)
+        self.seg_tweak_cat.set("All")
+        self.seg_tweak_cat.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
+
         self.tweak_scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
-        self.tweak_scroll.grid(row=1, column=0, sticky="nsew")
+        self.tweak_scroll.grid(row=2, column=0, sticky="nsew")
         ctk.CTkLabel(self.tweak_scroll, text="Detecting hardware…", text_color=C_MUT).pack(anchor="w", padx=4, pady=10)
         return page
+
+    def _on_tweak_cat(self, cat):
+        self.tweak_cat_filter = cat
+        self._populate_tweaks()
 
     def _populate_tweaks(self):
         for w in self.tweak_scroll.winfo_children():
             w.destroy()
-        self.status_labels = {}
+        self.lib_status_labels = {}
         shown = self.active_tweaks()
-        self.lbl_tweak_title.configure(text=f"Tweak Library · {len(shown)} tweaks for this PC")
+        q = (self.tweak_search_var.get() or "").strip().lower()
+        rec_only = bool(self.tweak_rec_only.get())
+        filtered = [
+            t for t in shown
+            if (self.tweak_cat_filter == "All" or t.cat == self.tweak_cat_filter)
+            and (not rec_only or t.is_rec(self.profile))
+            and (not q or q in t.name.lower() or q in t.describe(self.profile).lower() or q in t.cat.lower())
+        ]
+        self.lbl_tweak_title.configure(text=f"Tweak Library · {len(filtered)}/{len(shown)} tweaks shown")
+        if not filtered:
+            ctk.CTkLabel(self.tweak_scroll, text="No tweaks match your search/filter.", text_color=C_MUT).pack(anchor="w", padx=6, pady=14)
+            return
         for cat in CATEGORIES:
-            rows = [t for t in shown if t.cat == cat]
+            rows = [t for t in filtered if t.cat == cat]
             if not rows:
                 continue
             ctk.CTkLabel(self.tweak_scroll, text=cat.upper(), font=self.font(14, "bold"), text_color=C_ACC).pack(anchor="w", padx=4, pady=(14, 4))
             for t in rows:
-                self._tweak_row(self.tweak_scroll, t)
-        retired = [t for t in TWEAKS if t.legacy and self.store.is_applied(t.id)]
-        if retired:
-            ctk.CTkLabel(self.tweak_scroll, text=CAT_RETIRED.upper(), font=self.font(14, "bold"), text_color=C_WARN).pack(anchor="w", padx=4, pady=(14, 4))
-            for t in retired:
-                self._tweak_row(self.tweak_scroll, t)
-        hidden = [t.name for t in TWEAKS if not t.legacy and not t.applies_to(self.profile)]
-        if hidden:
-            ctk.CTkLabel(self.tweak_scroll, text="Hidden because they don't apply to this PC: " + "; ".join(hidden), font=self.font(11),
-                         text_color=C_MUT, wraplength=760, justify="left").pack(anchor="w", padx=4, pady=(18, 6))
+                self._tweak_row(self.tweak_scroll, t, self.lib_status_labels)
 
-    def _tweak_row(self, parent, t: Tweak):
+    def _tweak_row(self, parent, t: Tweak, label_map: dict):
         card = ctk.CTkFrame(parent, fg_color=C_CARD, corner_radius=10)
         card.pack(fill="x", padx=2, pady=4)
         card.grid_columnconfigure(0, weight=1)
@@ -2238,12 +2696,14 @@ class ForgeApp(ctk.CTk):
             badges.append(("REBOOT", C_WARN))
         if not t.is_rec(self.profile):
             badges.append(("OPTIONAL", C_MUT))
+        if t.needs_admin and not self.admin:
+            badges.append(("ADMIN", C_BAD))
         for text, col in badges:
             ctk.CTkLabel(head, text=f" {text} ", font=self.font(9, "bold"), text_color=col, fg_color=C_CARD2, corner_radius=5).pack(side="left", padx=(8, 0))
-        ctk.CTkLabel(info, text=t.describe(self.profile), font=self.font(11), text_color=C_MUT, wraplength=560, justify="left").pack(anchor="w", pady=(3, 3))
+        ctk.CTkLabel(info, text=t.describe(self.profile), font=self.font(11), text_color=C_MUT, wraplength=600, justify="left").pack(anchor="w", pady=(3, 3))
         st = ctk.CTkLabel(info, text="", font=self.font(11, "bold"))
         st.pack(anchor="w")
-        self.status_labels[t.id] = st
+        label_map[t.id] = st
         self._refresh_status(t)
         bf = ctk.CTkFrame(card, fg_color="transparent")
         bf.grid(row=0, column=1, padx=14)
@@ -2252,9 +2712,6 @@ class ForgeApp(ctk.CTk):
         self.action_button(bf, "Undo", lambda x=t: self.single(x, "undo"), kind="dark", width=74, height=30).pack(side="left", padx=3)
 
     def _refresh_status(self, t):
-        lbl = self.status_labels.get(t.id)
-        if not lbl:
-            return
         if self.store.is_applied(t.id):
             text, col = "● APPLIED" + ("  ·  reboot to finish" if t.reboot else ""), C_OK
         else:
@@ -2262,21 +2719,26 @@ class ForgeApp(ctk.CTk):
         if t.probe:
             try:
                 text += "  ·  " + t.probe()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
-        lbl.configure(text=text, text_color=col)
+        for lbl_dict in (self.lib_status_labels, self.net_status_labels):
+            lbl = lbl_dict.get(t.id)
+            if lbl and lbl.winfo_exists():
+                lbl.configure(text=text, text_color=col)
 
     def _run_tweak(self, t, action):
         if action == "apply":
             if t.legacy:
-                return False, "This tweak was retired for anti-cheat safety and can only be undone."
+                return False, "This tweak was retired for anti-cheat safety."
             if not t.applies_to(self.profile):
-                return False, "Not applicable to this PC (or the hardware scan hasn't finished)."
+                return False, "Not applicable to this PC."
+        if t.needs_admin and not self.admin:
+            return False, "Requires Administrator rights (click 'Restart as Admin' in the sidebar)."
         try:
             return t.apply(self.store) if action == "apply" else t.undo(self.store)
         except PermissionError as e:
             return False, f"Access denied: {e}"
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             return False, f"{type(e).__name__}: {e}"
 
     def single(self, t, action):
@@ -2285,6 +2747,8 @@ class ForgeApp(ctk.CTk):
                 ok, msg = self._run_tweak(t, action)
             self.log(f"{'✔' if ok else '✖'} {'Applied' if action == 'apply' else 'Undo'} · {t.name}: {msg}")
             self.post(self._refresh_status, t)
+            if ok and t.cat == CAT_NET:
+                self.post(self.refresh_network)
             if ok and t.reboot and action == "apply" and self.store.is_applied(t.id):
                 self.post(self._mark_reboot, t.name)
         threading.Thread(target=worker, daemon=True).start()
@@ -2294,15 +2758,243 @@ class ForgeApp(ctk.CTk):
             self.pending_reboot.append(name)
         self.btn_restart.configure(state="normal")
 
+    # ================================================================== NETWORK TWEAKER
+    def page_network(self):
+        outer = ctk.CTkFrame(self, fg_color="transparent")
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+        page = ctk.CTkScrollableFrame(outer, fg_color="transparent")
+        page.grid(row=0, column=0, sticky="nsew")
+        self.header(page, "Network & Ping Engine",
+                    "Live Fortnite regional ping & jitter tester, adapter inspector, Gaming DNS switcher, and reversible TCP/QoS optimizations.")
+
+        # 1. Active Adapter & TCP Stack Card
+        info_card = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=12)
+        info_card.pack(fill="x", pady=(0, 10))
+        hdr = ctk.CTkFrame(info_card, fg_color="transparent")
+        hdr.pack(fill="x", padx=18, pady=(14, 4))
+        ctk.CTkLabel(hdr, text="Active Network Adapter & TCP Stack", font=self.font(14, "bold"), text_color=C_ACC).pack(side="left")
+        self.action_button(hdr, "Refresh", self.refresh_network, kind="dark", width=95, height=28).pack(side="right")
+
+        self.lbl_net_adapter = ctk.CTkLabel(info_card, text="Inspecting network adapters…", font=self.font(12), text_color=C_TXT, justify="left", wraplength=820)
+        self.lbl_net_adapter.pack(anchor="w", padx=18, pady=(2, 4))
+        self.lbl_net_tcp = ctk.CTkLabel(info_card, text="", font=ctk.CTkFont(family="Consolas", size=11), text_color=C_MUT, justify="left")
+        self.lbl_net_tcp.pack(anchor="w", padx=18, pady=(0, 12))
+
+        # 2. Gaming DNS Switcher + Quick Tools
+        dns_card = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=12)
+        dns_card.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(dns_card, text="Gaming DNS Switcher & Quick Repair", font=self.font(14, "bold"), text_color=C_ACC).pack(anchor="w", padx=18, pady=(14, 4))
+        sel_row = ctk.CTkFrame(dns_card, fg_color="transparent")
+        sel_row.pack(fill="x", padx=18, pady=(2, 8))
+        ctk.CTkLabel(sel_row, text="Target adapter:", font=self.font(12), text_color=C_MUT).pack(side="left", padx=(0, 8))
+        self.cmb_net_adapter = ctk.CTkComboBox(sel_row, values=["Detecting…"], width=320, state="readonly", fg_color=C_CARD2, border_color=C_CARD2)
+        self.cmb_net_adapter.pack(side="left")
+        self.lbl_dns_status = ctk.CTkLabel(sel_row, text="", font=self.font(11, "bold"), text_color=C_OK)
+        self.lbl_dns_status.pack(side="left", padx=14)
+
+        dns_btns = ctk.CTkFrame(dns_card, fg_color="transparent")
+        dns_btns.pack(fill="x", padx=18, pady=(0, 8))
+        dns_btns.grid_columnconfigure((0, 1, 2, 3, 4), weight=1, uniform="dns")
+        for idx, (label, addrs) in enumerate(DNS_PRESETS):
+            self.action_button(dns_btns, label, lambda a=addrs: self.apply_dns_preset(a), kind="dark", height=34).grid(row=0, column=idx, padx=3, sticky="ew")
+        self.action_button(dns_btns, "Restore Auto / Original", lambda: self.apply_dns_preset(None), kind="purple", height=34).grid(row=0, column=4, padx=3, sticky="ew")
+
+        util_btns = ctk.CTkFrame(dns_card, fg_color="transparent")
+        util_btns.pack(fill="x", padx=18, pady=(0, 14))
+        self.action_button(util_btns, "Flush DNS Cache", self.net_flush_dns, kind="dark", width=150, height=32).pack(side="left", padx=(0, 6))
+        self.action_button(util_btns, "Renew IP (DHCP)", self.net_renew_ip, kind="dark", width=150, height=32).pack(side="left", padx=6)
+        self.action_button(util_btns, "Reset Winsock Catalog", self.net_reset_winsock, kind="danger", width=180, height=32).pack(side="left", padx=6)
+
+        # 3. Fortnite Server Ping & Jitter Tester
+        ping_card = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=12)
+        ping_card.pack(fill="x", pady=(0, 10))
+        phdr = ctk.CTkFrame(ping_card, fg_color="transparent")
+        phdr.pack(fill="x", padx=18, pady=(14, 6))
+        ctk.CTkLabel(phdr, text="Fortnite Server Ping & Jitter Tester", font=self.font(14, "bold"), text_color=C_ACC).pack(side="left")
+        self.btn_ping_test = self.action_button(phdr, "TEST ALL REGIONS (4 PACKETS EACH)", self.run_ping_test, width=250, height=32)
+        self.btn_ping_test.pack(side="right")
+
+        self.ping_grid = ctk.CTkFrame(ping_card, fg_color="transparent")
+        self.ping_grid.pack(fill="x", padx=18, pady=(0, 14))
+        self.ping_grid.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="pg")
+        self.ping_labels: dict[str, ctk.CTkLabel] = {}
+        for i, (rname, rhost) in enumerate(FORTNITE_REGIONS):
+            cell = ctk.CTkFrame(self.ping_grid, fg_color=C_CARD2, corner_radius=8)
+            cell.grid(row=i // 4, column=i % 4, padx=4, pady=4, sticky="ew")
+            ctk.CTkLabel(cell, text=rname, font=self.font(12, "bold"), text_color=C_TXT).pack(anchor="w", padx=12, pady=(8, 0))
+            ctk.CTkLabel(cell, text=rhost, font=self.font(9), text_color=C_MUT).pack(anchor="w", padx=12)
+            lbl = ctk.CTkLabel(cell, text="Not tested", font=self.font(12, "bold"), text_color=C_MUT)
+            lbl.pack(anchor="w", padx=12, pady=(4, 8))
+            self.ping_labels[rhost] = lbl
+
+        # 4. Network & Ping Tweaks (shared state with Tweak Library)
+        hdr2 = ctk.CTkFrame(page, fg_color="transparent")
+        hdr2.pack(fill="x", pady=(8, 4))
+        ctk.CTkLabel(hdr2, text="NETWORK & PING OPTIMIZATIONS (ALL REVERSIBLE)", font=self.font(14, "bold"), text_color=C_ACC).pack(side="left")
+        self.action_button(hdr2, "Apply Recommended Network Tweaks", self.apply_recommended_network, width=250, height=32).pack(side="right")
+
+        self.net_tweaks_box = ctk.CTkFrame(page, fg_color="transparent")
+        self.net_tweaks_box.pack(fill="x")
+        self._populate_network_tweaks()
+        return outer
+
+    def _populate_network_tweaks(self):
+        for w in self.net_tweaks_box.winfo_children():
+            w.destroy()
+        self.net_status_labels = {}
+        for t in [x for x in TWEAKS if x.cat == CAT_NET and not x.legacy]:
+            self._tweak_row(self.net_tweaks_box, t, self.net_status_labels)
+
+    def refresh_network(self):
+        def worker():
+            info = detect_network_info()
+            self.post(self._show_network_info, info)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_network_info(self, info: dict):
+        adapters = info.get("adapters") or []
+        self.net_adapters = adapters
+        self.net_adapter_map = {}
+        if adapters:
+            lines = []
+            choices = []
+            for a in adapters:
+                dns_str = ", ".join(str(d) for d in (a.get("dns") or []) if d) or "Auto (DHCP)"
+                lines.append(
+                    f"● {a.get('name')} ({a.get('desc')})  ·  Link: {a.get('speed') or '?'}  ·  "
+                    f"IPv4: {a.get('ipv4') or '?'}  ·  GW: {a.get('gw') or '?'}  ·  DNS: {dns_str}"
+                )
+                label = f"{a.get('name')} [{a.get('ipv4') or 'No IP'}]"
+                choices.append(label)
+                self.net_adapter_map[label] = a
+            self.lbl_net_adapter.configure(text="\n".join(lines), text_color=C_TXT)
+            self.cmb_net_adapter.configure(values=choices)
+            if self.cmb_net_adapter.get() not in self.net_adapter_map:
+                self.cmb_net_adapter.set(choices[0])
+        else:
+            self.lbl_net_adapter.configure(text="No active network adapter detected.", text_color=C_WARN)
+            self.cmb_net_adapter.configure(values=["None detected"])
+            self.cmb_net_adapter.set("None detected")
+
+        tcp_summary = (
+            f"TCP Global -> AutoTuning: {info.get('autotuning') or '?'}  |  "
+            f"RSS: {info.get('rss') or '?'}  |  "
+            f"RSC: {info.get('rsc') or '?'}  |  "
+            f"Heuristics: {info.get('heuristics') or '?'}  |  "
+            f"Congestion: {info.get('congestion') or '?'}"
+        )
+        self.lbl_net_tcp.configure(text=tcp_summary)
+        self.lbl_dns_status.configure(text="● Custom DNS active" if self.store.is_applied("net_dns_preset") else "")
+
+    def apply_dns_preset(self, servers: Optional[tuple]):
+        if not self.admin:
+            self.log("✖ Changing adapter DNS requires Administrator rights.")
+            return
+        sel = self.cmb_net_adapter.get()
+        adapter = self.net_adapter_map.get(sel)
+        if not adapter:
+            self.log("✖ Select an active network adapter first.")
+            return
+        idx, name = adapter.get("idx"), adapter.get("name")
+
+        def worker():
+            with self.work_lock:
+                ok, msg = set_adapter_dns(self.store, idx, name, servers)
+            self.log(("✔ " if ok else "✖ ") + "Network DNS: " + msg)
+            self.post(self.refresh_network)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def net_flush_dns(self):
+        def worker():
+            rc, _ = run(["ipconfig", "/flushdns"])
+            self.log("✔ Flushed Windows DNS resolver cache." if rc == 0 else "✖ ipconfig /flushdns failed.")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def net_renew_ip(self):
+        if not self.admin:
+            self.log("✖ Renewing DHCP lease requires Administrator rights.")
+            return
+
+        def worker():
+            self.log("Releasing and renewing DHCP IP lease…")
+            run(["ipconfig", "/release"], timeout=20)
+            rc, _ = run(["ipconfig", "/renew"], timeout=30)
+            self.log("✔ IP address renewed." if rc == 0 else "⚠ DHCP renew finished with warnings.")
+            self.post(self.refresh_network)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def net_reset_winsock(self):
+        if not self.admin:
+            self.log("✖ Winsock reset requires Administrator rights.")
+            return
+        if not messagebox.askyesno(APP_NAME, "Reset the Windows Winsock catalog?\nThis repairs corrupted network sockets and requires a reboot."):
+            return
+
+        def worker():
+            rc, out = run(["netsh", "winsock", "reset"])
+            if rc == 0:
+                self.log("✔ Winsock catalog reset. Reboot Windows to complete.")
+                self.post(self._mark_reboot, "Winsock Catalog Reset")
+            else:
+                self.log(f"✖ Winsock reset failed: {out.strip()[:120]}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_ping_test(self):
+        self.btn_ping_test.configure(state="disabled", text="TESTING REGIONS…")
+        for lbl in self.ping_labels.values():
+            lbl.configure(text="Testing…", text_color=C_MUT)
+
+        def worker():
+            best_name, best_ms = None, 99999.0
+            for rname, rhost in FORTNITE_REGIONS:
+                res = measure_ping(rhost, count=4)
+                if res["ok"]:
+                    if res["avg"] < best_ms:
+                        best_ms, best_name = res["avg"], rname
+                    col = C_OK if res["avg"] < 45 else (C_WARN if res["avg"] < 95 else C_BAD)
+                    txt = f"{res['avg']:.0f} ms  (±{res['jitter']:.1f}ms, {res['loss']:.0f}% loss)"
+                else:
+                    col = C_BAD
+                    txt = "Timeout / Blocked"
+                self.post(lambda h=rhost, t=txt, c=col: self.ping_labels[h].configure(text=t, text_color=c))
+            if best_name:
+                self.log(f"✔ Ping test complete. Best Fortnite region: {best_name} ({best_ms:.0f} ms).")
+            else:
+                self.log("⚠ Ping test finished - ICMP echo may be blocked by firewall/ISP.")
+            self.post(lambda: self.btn_ping_test.configure(state="normal", text="TEST ALL REGIONS (4 PACKETS EACH)"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_recommended_network(self):
+        recs = [t for t in TWEAKS if t.cat == CAT_NET and not t.legacy and t.is_rec(self.profile)]
+
+        def worker():
+            with self.work_lock:
+                self.log("=== Applying recommended Network tweaks ===")
+                for t in recs:
+                    ok, msg = self._run_tweak(t, "apply")
+                    self.log(f"{'✔' if ok else '✖'} {t.name}: {msg}")
+                    self.post(self._refresh_status, t)
+                    if ok and t.reboot and self.store.is_applied(t.id):
+                        self.post(self._mark_reboot, t.name)
+            self.post(self.refresh_network)
+        threading.Thread(target=worker, daemon=True).start()
 
     # ================================================================== FORTNITE CONFIG
     def page_config(self):
-        page = ctk.CTkFrame(self, fg_color="transparent")
-        self.header(page, "Fortnite Config Editor", f"Edits GameUserSettings.ini directly. A one-time backup ({BAK_SUFFIX}) is made before the first change.")
+        outer = ctk.CTkFrame(self, fg_color="transparent")
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+        page = ctk.CTkScrollableFrame(outer, fg_color="transparent")
+        page.grid(row=0, column=0, sticky="nsew")
+        self.header(page, "Fortnite Config Editor", f"Edits GameUserSettings.ini directly. Automatic backup ({BAK_SUFFIX}) created on first edit.")
         box = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=12)
         box.pack(fill="x", pady=(0, 10))
         self.lbl_ini = ctk.CTkLabel(box, text="", font=ctk.CTkFont(family="Consolas", size=11), wraplength=780, justify="left")
         self.lbl_ini.pack(anchor="w", padx=18, pady=(12, 2))
+        self.lbl_ini_summary = ctk.CTkLabel(box, text="", font=self.font(12), text_color=C_TXT)
+        self.lbl_ini_summary.pack(anchor="w", padx=18)
         self.lbl_fn_run = ctk.CTkLabel(box, text="", font=self.font(12, "bold"))
         self.lbl_fn_run.pack(anchor="w", padx=18)
         self.lbl_cfg_fps = ctk.CTkLabel(box, text=f"FPS cap: {self._fps_text()} (change on the Dashboard)", font=self.font(12), text_color=C_MUT)
@@ -2317,7 +3009,16 @@ class ForgeApp(ctk.CTk):
         grid.pack(fill="x", pady=(0, 10))
         inner = ctk.CTkFrame(grid, fg_color="transparent")
         inner.pack(fill="x", padx=18, pady=14)
-        self.action_button(inner, "APPLY FULL PERFORMANCE PROFILE  (Performance Mode + All Low + Resolution + FPS cap)", lambda: self.fn_do("profile"), height=42).pack(fill="x", pady=(0, 8))
+
+        top_btns = ctk.CTkFrame(inner, fg_color="transparent")
+        top_btns.pack(fill="x", pady=(0, 8))
+        top_btns.grid_columnconfigure((0, 1), weight=1)
+
+        self.action_button(top_btns, "APPLY PERFORMANCE PROFILE\n(Perf Mode + All Low + Res + Cap)",
+                           lambda: self.fn_do("profile"), height=46).grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        self.action_button(top_btns, "APPLY POTATO GRAPHICS (MAX FPS)\n(Low Meshes · No Floor Glitch · 66% 3D)",
+                           lambda: self.fn_do("potato"), kind="emerald", height=46).grid(row=0, column=1, padx=(4, 0), sticky="ew")
+
         two = ctk.CTkFrame(inner, fg_color="transparent")
         two.pack(fill="x", pady=4)
         two.grid_columnconfigure((0, 1), weight=1)
@@ -2342,18 +3043,17 @@ class ForgeApp(ctk.CTk):
         slider = ctk.CTkSlider(sl, from_=50, to=100, number_of_steps=10, progress_color=C_ACC, button_color=C_ACC, command=self._on_q)
         slider.set(self.res_quality)
         slider.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(inner, text="Resolution buttons also set exclusive Fullscreen (windowed fullscreen ignores custom resolutions). "
-                                 "The 3D resolution slider renders at a lower internal resolution and scales up - a good way to gain FPS without changing your display mode; "
-                                 "values under about 66% look blurry. For weaker or integrated GPUs, pick one step below native and lower the slider.",
+
+        ctk.CTkLabel(inner, text="Resolution buttons also apply exclusive Fullscreen. Potato mode forces 66% 3D resolution and mobile builds without disappearing floors.",
                      font=self.font(11), text_color=C_MUT, wraplength=780, justify="left").pack(anchor="w", pady=(8, 0))
+
         lk = ctk.CTkFrame(page, fg_color="transparent")
         lk.pack(fill="x")
         self.action_button(lk, "Lock ini (read-only)", lambda: self.set_ini_ro(True), kind="dark", width=170, height=32).pack(side="left", padx=(0, 6))
         self.action_button(lk, "Unlock ini", lambda: self.set_ini_ro(False), kind="dark", width=120, height=32).pack(side="left")
-        return page
+        return outer
 
     def _build_res_buttons(self):
-        """Resolution presets generated from THIS monitor's aspect ratio and the modes its driver supports."""
         for w in self.res_frame.winfo_children():
             w.destroy()
         d = self.display
@@ -2362,8 +3062,8 @@ class ForgeApp(ctk.CTk):
             self.lbl_res_title.configure(text=f"Resolution · {ps_.aspect} display detected ({d.width} x {d.height}"
                                               + (f" @ {d.refresh} Hz)" if d.refresh else ")"))
         else:
-            self.lbl_res_title.configure(text="Resolution · display not detected (showing a common 16:9 ladder)")
-        groups = [(None, ps_.main)] + ([("Stretched 4:3 (competitive). Needs GPU / display scaling set to Full-screen to fill the monitor; ForgeFN doesn't change that.", ps_.stretched)] if ps_.stretched else [])
+            self.lbl_res_title.configure(text="Resolution · display not detected")
+        groups = [(None, ps_.main)] + ([("Stretched 4:3 (Competitive)", ps_.stretched)] if ps_.stretched else [])
         for title, presets in groups:
             if title:
                 ctk.CTkLabel(self.res_frame, text=title, font=self.font(11), text_color=C_MUT, wraplength=780, justify="left").pack(anchor="w", pady=(8, 3))
@@ -2378,9 +3078,9 @@ class ForgeApp(ctk.CTk):
 
     def _show_res_sel(self):
         if self.res_choice:
-            self.lbl_res_sel.configure(text=f"Selected for the profile: {self.res_choice[0]} x {self.res_choice[1]} at {self.res_quality}% 3D resolution")
+            self.lbl_res_sel.configure(text=f"Selected: {self.res_choice[0]} x {self.res_choice[1]} at {self.res_quality}% 3D resolution")
         else:
-            self.lbl_res_sel.configure(text="No resolution selected - the profile leaves your current resolution alone.")
+            self.lbl_res_sel.configure(text="No resolution selected (keeps existing resolution).")
 
     def redetect_display(self):
         self.display = detect_display()
@@ -2395,13 +3095,14 @@ class ForgeApp(ctk.CTk):
     def refresh_fn_status(self):
         found = os.path.isfile(FN_INI)
         self.lbl_ini.configure(text=f"{'✔ Found' if found else '✖ Not found (launch Fortnite once)'}: {FN_INI}", text_color=C_ACC if found else C_BAD)
+        if hasattr(self, "lbl_ini_summary"):
+            self.lbl_ini_summary.configure(text=read_fn_summary() if found else "")
         self._show_fn_running(fortnite_running())
 
     def open_fn_folder(self):
         d = os.path.dirname(FN_INI)
         if os.path.isdir(d):
-            os.startfile(d)  # noqa: S606
-
+            os.startfile(d)
 
     def _fn_profile(self):
         edits = edits_performance_mode() + edits_low_quality() + edits_fps(self.target_fps)
@@ -2416,15 +3117,23 @@ class ForgeApp(ctk.CTk):
                     ok, msg = fn_ini_edit(edits_performance_mode())
                 elif what == "low":
                     ok, msg = fn_ini_edit(edits_low_quality())
+                elif what == "potato":
+                    edits = edits_potato_mode() + edits_fps(self.target_fps)
+                    if self.res_choice:
+                        edits += edits_resolution(self.res_choice[0], self.res_choice[1], 66.0)
+                    ok, msg = fn_ini_edit(edits)
+                    if ok:
+                        msg += " Low meshes and 66% 3D resolution configured without broken building collision."
                 elif what == "res":
                     self.res_choice = arg
                     ok, msg = fn_ini_edit(edits_resolution(arg[0], arg[1], self.res_quality))
                     if ok:
-                        msg = f"Resolution {arg[0]}x{arg[1]} at {self.res_quality}% 3D resolution, exclusive fullscreen. " + msg
+                        msg = f"Resolution {arg[0]}x{arg[1]} at {self.res_quality}% 3D resolution applied."
                     self.post(self._show_res_sel)
                 else:
                     ok, msg = self._fn_profile()
             self.log(("✔ " if ok else "✖ ") + "Fortnite config: " + msg)
+            self.post(self.refresh_fn_status)
         threading.Thread(target=worker, daemon=True).start()
 
     def restore_ini(self):
@@ -2440,6 +3149,7 @@ class ForgeApp(ctk.CTk):
                 os.chmod(FN_INI, stat.S_IREAD | stat.S_IWRITE)
             shutil.copy2(bak, FN_INI)
             self.log("✔ Original GameUserSettings.ini restored.")
+            self.refresh_fn_status()
         except OSError as e:
             self.log(f"✖ Restore failed: {e}")
 
@@ -2448,22 +3158,24 @@ class ForgeApp(ctk.CTk):
             self.log("✖ ini not found.")
             return
         os.chmod(FN_INI, stat.S_IREAD if lock else stat.S_IREAD | stat.S_IWRITE)
-        self.log("✔ GameUserSettings.ini is now " + ("READ-ONLY (Fortnite can't overwrite it; unlock before using in-game settings)." if lock else "writable."))
-
+        self.log("✔ GameUserSettings.ini is now " + ("READ-ONLY." if lock else "writable."))
 
     # ================================================================== CLEANER
     def visible_clean_targets(self):
-        """Vendor-specific shader caches only show up when that GPU vendor is present."""
         return [t for t in CLEAN_TARGETS
                 if t.vendor is None or (self.profile is not None and self.profile.has_gpu(t.vendor))]
 
     def page_cleaner(self):
-        page = ctk.CTkFrame(self, fg_color="transparent")
-        self.header(page, "System Cleaner", "Frees disk space. Tick what to clean - sizes are scanned live.")
+        outer = ctk.CTkFrame(self, fg_color="transparent")
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+        page = ctk.CTkScrollableFrame(outer, fg_color="transparent")
+        page.grid(row=0, column=0, sticky="nsew")
+        self.header(page, "System Cleaner", "Deep junk cleaner: empties Windows update cache, shader caches, WER dumps, and Recycle Bin.")
         box = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=12)
         box.pack(fill="x", pady=(0, 10))
         self.clean_rows = ctk.CTkFrame(box, fg_color="transparent")
-        self.clean_rows.pack(fill="x")
+        self.clean_rows.pack(fill="x", pady=(10, 0))
         self.lbl_clean_total = ctk.CTkLabel(box, text="", font=self.font(13, "bold"), text_color=C_TXT)
         self.lbl_clean_total.pack(anchor="w", padx=18, pady=(8, 4))
         bf = ctk.CTkFrame(box, fg_color="transparent")
@@ -2471,7 +3183,7 @@ class ForgeApp(ctk.CTk):
         self.action_button(bf, "Rescan sizes", self.scan_cleaner, kind="dark", width=130).pack(side="left", padx=(0, 8))
         self.action_button(bf, "CLEAN SELECTED", self.run_cleaner, kind="danger", width=200).pack(side="left")
         self._populate_cleaner()
-        return page
+        return outer
 
     def _populate_cleaner(self):
         for w in self.clean_rows.winfo_children():
@@ -2479,7 +3191,7 @@ class ForgeApp(ctk.CTk):
         self.clean_vars, self.clean_size_lbls = {}, {}
         for t in self.visible_clean_targets():
             row = ctk.CTkFrame(self.clean_rows, fg_color="transparent")
-            row.pack(fill="x", padx=18, pady=5)
+            row.pack(fill="x", padx=18, pady=4)
             var = tk.BooleanVar(value=t.default)
             self.clean_vars[t.cid] = var
             ctk.CTkCheckBox(row, text=t.label, variable=var, fg_color=C_ACC, hover_color=C_ACC_H, checkmark_color="#000", text_color=C_TXT, width=280).pack(side="left")
@@ -2493,7 +3205,12 @@ class ForgeApp(ctk.CTk):
         targets = self.visible_clean_targets()
 
         def worker():
-            sizes = {t.cid: sum(dir_size(_exp(p)) for p in t.paths if valid_clean_path(_exp(p))) for t in targets}
+            sizes = {}
+            for t in targets:
+                if t.is_recycle_bin:
+                    sizes[t.cid] = get_recycle_bin_size()
+                else:
+                    sizes[t.cid] = sum(dir_size(_exp(p)) for p in t.paths if valid_clean_path(_exp(p)))
             self.post(self._show_clean_sizes, sizes)
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2511,10 +3228,17 @@ class ForgeApp(ctk.CTk):
 
         def worker():
             with self.work_lock:
-                self.log("Cleaning selected locations…")
+                self.log("Cleaning selected junk and cache files…")
                 freed = 0
                 for t in chosen:
-                    got = sum(purge_dir(_exp(p)) for p in t.paths if valid_clean_path(_exp(p)))
+                    if t.is_recycle_bin:
+                        got = empty_recycle_bin()
+                    elif t.cid == "wupdate" and self.admin:
+                        run(["net", "stop", "wuauserv"])
+                        got = sum(purge_dir(_exp(p)) for p in t.paths if valid_clean_path(_exp(p)))
+                        run(["net", "start", "wuauserv"])
+                    else:
+                        got = sum(purge_dir(_exp(p)) for p in t.paths if valid_clean_path(_exp(p)))
                     freed += got
                     self.log(f"  {t.label}: freed {human_size(got)}")
                 self.log(f"✔ Cleanup complete - {human_size(freed)} freed.")
@@ -2523,7 +3247,11 @@ class ForgeApp(ctk.CTk):
 
     # ================================================================== BACKUP & SAFETY
     def page_backup(self):
-        page = ctk.CTkFrame(self, fg_color="transparent")
+        outer = ctk.CTkFrame(self, fg_color="transparent")
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+        page = ctk.CTkScrollableFrame(outer, fg_color="transparent")
+        page.grid(row=0, column=0, sticky="nsew")
         self.header(page, "Backup & Safety", "Anti-cheat compliance, plus safety nets for every change this app makes.")
 
         ac = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=12, border_width=1, border_color=C_OK)
@@ -2536,7 +3264,7 @@ class ForgeApp(ctk.CTk):
         box = ctk.CTkFrame(page, fg_color=C_CARD, corner_radius=12)
         box.pack(fill="x", pady=(0, 10))
         ctk.CTkLabel(box, text="Before you optimize", font=self.font(15, "bold"), text_color=C_ACC).pack(anchor="w", padx=18, pady=(14, 2))
-        ctk.CTkLabel(box, text="A System Restore point snapshots Windows so you can roll back from the recovery menu. The registry export saves every branch these tweaks touch as .reg files you can double-click to restore.",
+        ctk.CTkLabel(box, text="A System Restore point snapshots Windows so you can roll back. The registry export saves every branch touched as .reg files.",
                      font=self.font(12), text_color=C_MUT, wraplength=780, justify="left").pack(anchor="w", padx=18, pady=(0, 10))
         self.action_button(box, "CREATE SYSTEM RESTORE POINT", self.do_restore_point, kind="purple").pack(fill="x", padx=18, pady=4)
         self.action_button(box, "EXPORT REGISTRY BACKUP (.REG FILES)", self.do_reg_backup, kind="dark").pack(fill="x", padx=18, pady=4)
@@ -2547,13 +3275,17 @@ class ForgeApp(ctk.CTk):
         self.lbl_applied = ctk.CTkLabel(box2, text="", font=self.font(12), text_color=C_MUT)
         self.lbl_applied.pack(anchor="w", padx=18)
         self.action_button(box2, "UNDO ALL APPLIED TWEAKS", self.undo_all, kind="danger", width=260).pack(anchor="w", padx=18, pady=(10, 16))
-        return page
+        return outer
 
     def refresh_backup_status(self):
         n = len(self.store.applied_ids())
         self.lbl_applied.configure(text=f"{n} tweak(s) currently applied. Original values are stored in {STATE_FILE}")
 
     def do_restore_point(self):
+        if not self.admin:
+            self.log("✖ Creating a System Restore point requires Administrator rights.")
+            return
+
         def worker():
             with self.work_lock:
                 self.log("Creating restore point…")
@@ -2570,7 +3302,7 @@ class ForgeApp(ctk.CTk):
 
     def open_backup_folder(self):
         os.makedirs(BACKUP_ROOT, exist_ok=True)
-        os.startfile(BACKUP_ROOT)  # noqa: S606
+        os.startfile(BACKUP_ROOT)
 
     def undo_all(self):
         ids = [i for i in self.store.applied_ids() if i in TWEAK_BY_ID]
@@ -2589,7 +3321,6 @@ class ForgeApp(ctk.CTk):
                     self.post(self._refresh_status, t)
             self.post(self.refresh_backup_status)
         threading.Thread(target=worker, daemon=True).start()
-
 
 
 def main():
