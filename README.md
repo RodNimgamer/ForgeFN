@@ -36,3 +36,10 @@ git clone https://github.com/RodNimgamer/ForgeFN.git
 cd ForgeFN
 pip install -r requirements.txt
 python forgefn.py
+(If pip is not recognized on Windows, use py -m pip install -r requirements.txt and py forgefn.py.)
+📦 Building a Clean .exe (Optional)
+To compile a standalone Windows build without UPX or --onefile packer heuristics:
+Bash
+pip install pyinstaller
+python build_exe.py
+The compiled application will be output to dist\ForgeFN\ForgeFN.exe (keep the _internal folder in the same directory as ForgeFN.exe).
